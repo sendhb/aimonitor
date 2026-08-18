@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sync — 跨机器版本化同步（baseline 模式）
+
+从共享发布位置按 manifest 拉取指定版本到本地项目。
+
+用法:
+  cli/sync <source-dir> [--version <ver>] [--package-name <name>] [--dest <dir>]
+  cli/sync ../shared-baseline --package-name planning          # 最新版本
+  cli/sync ../shared-baseline --package-name planning --version sync-20260703-02
+  cli/sync ../shared-baseline --package-name planning --dest docs/planning-versions
+
+参考:
+  ../baseline/ 的 cross-repo-sync-policy.md（单向显式发布，不做双向自动同步）
+"""
+import argparse
+import json
+import os
+import shutil
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def list_versions(source_dir, package_name):
+    pkg_dir = os.path.join(source_dir, package_name)
+    if not os.path.isdir(pkg_dir):
+        return []
+    return sorted(os.listdir(pkg_dir))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="从共享发布位置拉取版本到本地")
+    ap.add_argument("source_dir", help="共享发布位置（git clone/共享盘）")
+    ap.add_argument("--package-name", default="pkg", help="包类型名")
+    ap.add_argument("--version", default="latest", help="版本号（默认 latest）")
+    ap.add_argument("--dest", default=None, help="目标目录（默认项目根下对应目录）")
+    args = ap.parse_args()
+
+    versions = list_versions(args.source_dir, args.package_name)
+    if not versions:
+        sys.exit(f"✗ {args.source_dir}/{args.package_name} 下没有发布版本")
+
+    if args.version == "latest":
+        ver = versions[-1]
+    else:
+        if args.version not in versions:
+            sys.exit(f"✗ 版本 {args.version} 不存在，可用: {', '.join(versions)}")
+        ver = args.version
+
+    pkg_dir = os.path.join(args.source_dir, args.package_name, ver)
+    manifest_path = os.path.join(pkg_dir, "MANIFEST.json")
+    if not os.path.isfile(manifest_path):
+        sys.exit(f"✗ 缺少 manifest: {manifest_path}（非标准发布包）")
+
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    # 确定目标：默认放项目根的 <package-name>-versions/<ver>/
+    if args.dest:
+        dest_root = args.dest
+    else:
+        dest_root = os.path.join(ROOT, f"{args.package_name}-versions")
+    dest_dir = os.path.join(dest_root, ver)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # 按 manifest 复制目录
+    copied = 0
+    for name in manifest.get("directories", {}):
+        src = os.path.join(pkg_dir, name)
+        dst = os.path.join(dest_dir, name)
+        if not os.path.isdir(src):
+            continue
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        copied += 1
+
+    # 写同步记录（对应 prototype-sync-versioning-rule 的 primary record）
+    record = {
+        "synced_at": __import__("datetime").datetime.now().isoformat(),
+        "version": ver,
+        "package": args.package_name,
+        "manifest": manifest_path,
+    }
+    with open(os.path.join(dest_dir, "SYNC-RECORD.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+
+    print(f"✓ 已同步: {dest_dir}")
+    print(f"  版本: {ver}")
+    print(f"  目录: {copied} 个")
+    print(f"  记录: {os.path.join(dest_dir, 'SYNC-RECORD.json')}")
+    print(f"  提示: 如目标仓需追溯历史，以源 project 的 sync log 为准（cross-repo-sync-policy）")
+
+
+if __name__ == "__main__":
+    main()

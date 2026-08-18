@@ -1,0 +1,56 @@
+# AIOS Framework — 通用忽略规则
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+dist-ssr/
+build/
+*.local
+
+# Editor
+.idea
+.DS_Store
+*.sw?
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Testing
+coverage/
+*.lcov
+
+# Temp
+tmp
+*.tmp
+*.temp
+.cache/
+
+# AI runtime generated data (keep directory structure, templates, and state files)
+runtime/tasks/TASK-*.md
+runtime/tasks/INDEX.md
+runtime/reviews/REVIEW-*.md
+runtime/verification/VERIFY-*.md
+runtime/logs/*
+runtime/locks/*
+
+# Python 编译缓存
+__pycache__/
+*.pyc
+
+# AI agent 运行时状态
+.codewhale/
+
+# 多机监控 agent token（TASK-031 规格：security-policy 密钥不进配置文件/不入库）
+config/agents.json
+config/agents.example.json
+
+# 生成目录（generated_dirs，只由生成器写入）
+dist/
+
+# 运行时数据（历史快照 SQLite，TASK-022：监控器自身存储，不进 git）
+data/

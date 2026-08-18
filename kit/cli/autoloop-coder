@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# ============================================================
+# autoloop-coder — 无人值守 Coder 循环（可选/实验性）
+#
+# 定时轮询 runtime/tasks/，捡 open / in-progress（含被 Reviewer 打回
+# 返工）的任务，用一个独立的无头 Claude Code 会话按 kit/agents/coder/role.md
+# 实现，跑 verify，最后提交审查（./kit/cli/task review）。
+#
+# 与 autoloop-reviewer 是两个完全独立的进程，只通过 runtime/tasks/ 文件
+# 状态耦合，不直接通信 —— 对应 agents/reviewer/role.md 的“生成者 ≠ 审查者，
+# 必须不同会话/工具”要求。
+#
+# ⚠️ 危险操作：--unattended 会给 claude -p 传 --dangerously-skip-permissions，
+# agent 将不经确认执行任意 shell/文件写操作。仅在隔离环境（容器 / git
+# worktree / 一次性沙箱）中启用，并确保有独立版本控制可随时回滚。
+# P0 风险任务（modification-policy.md）本脚本不会自动实现，会转 blocked
+# 等人工先补 approval-ref。
+#
+# 用法:
+#   cli/autoloop-coder [--interval SEC] [--once] [--unattended] [--id NAME] [--timeout SEC]
+#
+# 心跳/事件产出（给 harness 监控系统读）:
+#   runtime/logs/autoloop-coder.heartbeat        每轮循环开始时间戳（判断循环是否卡死）
+#   runtime/logs/autoloop-coder-events.jsonl     每轮一行 JSON：{ts, task, outcome}
+# ============================================================
+set -euo pipefail
+
+# 兼容两种布局（平铺 cli/ 与 kit 子目录 kit/cli/）：向上找含 aios.config.yaml 的项目根
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ ! -f "$ROOT/aios.config.yaml" ] && [ "$ROOT" != "/" ]; do
+  ROOT="$(dirname "$ROOT")"
+done
+cd "$ROOT"
+
+INTERVAL=300
+ONCE=0
+UNATTENDED=0
+TIMEOUT=1800
+AGENT_ID="${AUTOLOOP_CODER_ID:-autoloop-coder}"
+LLM="${AIOS_LLM:-claude}"  # claude | deepseek | pi（TASK-009）
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --once) ONCE=1; shift ;;
+    --unattended) UNATTENDED=1; shift ;;
+    --id) AGENT_ID="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --llm) LLM="$2"; shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 1 ;;
+  esac
+done
+
+LOG_DIR="$ROOT/runtime/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/autoloop-coder-$(date +%F).log"
+NAME="coder"
+# shellcheck source=cli/lib/heartbeat.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/heartbeat.sh"
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+
+# —— 进程级防重入锁（TASK-008）——
+# 无论是否经 kit/cli/autoloop 启动器，直接执行本脚本也持有同一把锁：
+# 同一角色（coder）同时只允许一个进程，堵住绕过启动器入口的并发竞态
+# （两个 coder 并发 pick 同一 open/in-progress 任务 → 重复实现/重复提交）。
+LOCK_FILE="$ROOT/runtime/locks/autoloop-coder.lock"
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  log "✗ 已有 autoloop-coder 实例在运行（$LOCK_FILE）——拒绝启动（TASK-008 进程级锁）"
+  exit 1
+fi
+# 锁随 fd 9 持有至本进程退出（子 LLM 会话继承期间仍持有），常驻/单轮均自动释放
+
+field() { grep -m1 "^[[:space:]]*$2:" "$1" | awk '{print $2}'; }
+
+# 选第一个 open 或 in-progress（按任务编号升序）任务
+pick_task() {
+  local f status
+  for f in $(ls "$ROOT"/runtime/tasks/TASK-*.md 2>/dev/null | sort); do
+    status="$(field "$f" status)"
+    [ "$status" = "open" ] || [ "$status" = "in-progress" ] || continue
+    basename "$f" .md | grep -o '^TASK-[0-9]\{3\}'
+    return 0
+  done
+  return 1
+}
+
+run_once() {
+  heartbeat
+  local task_id task_file risk approval status
+  if ! task_id=$(pick_task); then
+    log "无待处理任务，跳过本轮"
+    emit_event - no_task
+    return 0
+  fi
+  task_file=$(ls "$ROOT"/runtime/tasks/"$task_id"-*.md | head -1)
+  risk="$(field "$task_file" risk)"
+  approval="$(field "$task_file" approval-ref)"
+
+  if [ "$risk" = "P0" ] && { [ -z "$approval" ] || [ "$approval" = "none" ]; }; then
+    log "⚠ $task_id 是 P0 且无 approval-ref，转 blocked 等人工批准（不自动实现）"
+    ./kit/cli/task block "$task_id" "P0 任务需要人工先在 approval-ref 记录批准，autoloop-coder 不会自动实现" >>"$LOG_FILE" 2>&1 || true
+    emit_event "$task_id" blocked_p0
+    return 0
+  fi
+
+  status="$(field "$task_file" status)"
+  if [ "$status" = "open" ]; then
+    ./kit/cli/task start "$task_id" >>"$LOG_FILE" 2>&1
+  fi
+  # 记录 assignee，供 autoloop-reviewer 用于跳过"生成者=审查者"的任务
+  sed -i "s/^\([[:space:]]*assignee:[[:space:]]*\).*/\1$AGENT_ID/" "$task_file"
+
+  log "▶ 开始实现 $task_id"
+  local prompt
+  prompt="你现在扮演 Coder 角色（kit/agents/coder/role.md）。任务：$task_id（见 runtime/tasks/$(basename "$task_file")）。
+按 aios/execution/engine.md 的通用闭环（命中规格变更时按 aios/execution/sdd-workflow.md）执行：
+1. 读任务与相关 knowledge/，制定计划
+2. 实现（只改 config.source_dirs，绝不手动改 config.generated_dirs）
+3. 执行: ./kit/cli/task verify $task_id（真正跑 aios.config.yaml 里的 build/lint/test/check 并生成 VERIFY 记录，不要手写这份记录）
+4. 通过后执行: ./kit/cli/task review $task_id
+注意：task 是 Python 3 脚本，必须用 ./kit/cli/task 或 python3 kit/cli/task 调用，**不要用 bash kit/cli/task**（bash 会把 Python 源码当 shell 逐行解析，产生巨量输出并死循环，脚本已自带防护）。
+不要自行 approve 或 done —— 审查是 Reviewer 角色的职责，必须是另一个会话。
+如果中途发现必须动 P0 风险文件（modification-policy.md）才能继续，执行:
+./kit/cli/task block $task_id \"需要人工批准: <原因>\" 然后停止，不要继续实现。"
+
+  local rc=0
+  if [ "$LLM" = "deepseek" ]; then
+    # deepseek：OpenAI 兼容 API（cli/lib/llm.sh，key 读自 pi 配置，不打印）
+    timeout "$TIMEOUT" bash "$(dirname "${BASH_SOURCE[0]}")/lib/llm.sh" deepseek "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
+  elif [ "$LLM" = "pi" ]; then
+    # pi coding agent（TASK-009）：非交互模式 --no-session
+    timeout "$TIMEOUT" bash "$(dirname "${BASH_SOURCE[0]}")/lib/llm.sh" pi "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
+  elif [ "$UNATTENDED" = "1" ]; then
+    timeout "$TIMEOUT" claude -p "$prompt" --dangerously-skip-permissions >>"$LOG_FILE" 2>&1 || rc=$?
+  else
+    timeout "$TIMEOUT" claude -p "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
+  fi
+  if [ "$rc" -eq 124 ]; then
+    log "✗ $task_id 会话超时（>${TIMEOUT}s），已 kill（见 $LOG_FILE）"
+    emit_event "$task_id" timeout
+  elif [ "$rc" -ne 0 ]; then
+    log "✗ $task_id 会话异常退出，exit=$rc（见 $LOG_FILE）"
+    emit_event "$task_id" error
+  else
+    emit_event "$task_id" ok
+  fi
+  log "■ 本轮结束 $task_id"
+}
+
+if [ "$ONCE" = "1" ]; then
+  run_once
+else
+  log "autoloop-coder 启动（id=$AGENT_ID, interval=${INTERVAL}s, unattended=$UNATTENDED）"
+  while true; do
+    run_once
+    sleep "$INTERVAL"
+  done
+fi

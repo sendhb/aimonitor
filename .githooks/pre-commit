@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# generated_dirs 保护 + commands.check —— 见 kit/cli/lib/precommit_check.py
+exec python3 "$(git rev-parse --show-toplevel)/kit/cli/lib/precommit_check.py"

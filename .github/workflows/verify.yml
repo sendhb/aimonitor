@@ -1,0 +1,24 @@
+# 服务端最终防线（aios/execution/engine.md §5 Verify）：
+# 不管改动来自哪个 AI 工具还是人，push/PR 都要过这一关，本地 hook 被
+# --no-verify 绕过也挡不住这里。配合分支保护规则（Settings → Branches →
+# Require status checks to pass；Require a pull request review from someone
+# other than the author，对应"生成者 ≠ 审查者"）效果最完整，但这两项
+# 分支保护本身需要仓库管理员在 GitHub 网页上开，没法用这个 workflow 文件代劳。
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: framework health check
+        run: bash cli/check
+      - name: unit tests
+        run: python3 -m unittest discover -s tests

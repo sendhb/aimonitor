@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ============================================================
+# sandbox-run — 无网络容器执行任意命令
+#
+# 落地 aios/governance/security-policy.md 的 Rule of Two：容器默认
+# --network none，即使里面跑的 agent 同时具备"处理不可信输入"和
+# "访问敏感数据"，也没有网络能外传——这一层是 OS/容器级强制，
+# 跟容器里跑的是 Claude Code、Codex CLI 还是别的工具完全无关。
+#
+# 用法:
+#   cli/sandbox-run -- <command...>            # 默认无网络
+#   cli/sandbox-run --network -- <command...>  # 显式需要网络时才开
+# ============================================================
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 兼容两种布局（平铺 cli/ 与 kit 子目录 kit/cli/）：向上找含 aios.config.yaml 的项目根
+while [ ! -f "$ROOT/aios.config.yaml" ] && [ "$ROOT" != "/" ]; do
+  ROOT="$(dirname "$ROOT")"
+done
+NET="none"
+if [ "${1:-}" = "--network" ]; then
+  NET="bridge"
+  shift
+fi
+if [ "${1:-}" = "--" ]; then
+  shift
+fi
+if [ $# -eq 0 ]; then
+  echo "用法: cli/sandbox-run [--network] -- <command...>" >&2
+  exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "✗ 需要 docker" >&2
+  exit 1
+fi
+
+IMAGE="aios-sandbox"
+docker build -q -t "$IMAGE" "$ROOT/kit/tools/sandbox" >/dev/null
+
+docker run --rm -i \
+  --network "$NET" \
+  --read-only --tmpfs /tmp \
+  -v "$ROOT:/workspace" \
+  -w /workspace \
+  "$IMAGE" "$*"

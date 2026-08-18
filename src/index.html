@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>aimonitor — AI 项目执行监控</title>
+  <!-- TASK-028: 首帧前按记忆/系统偏好设主题，防浅色用户 FOUC 闪暗 -->
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("aimonitor-theme"); } catch (e) {}
+      if (t !== "light" && t !== "dark") {
+        t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+      }
+      document.documentElement.setAttribute("data-theme", t);
+    })();
+  </script>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- 移动端侧栏遮罩（TASK-030：点击关闭抽屉） -->
+  <div id="sidebar-mask" class="sidebar-mask hidden"></div>
+
+  <!-- ===== 侧边栏导航 ===== -->
+  <aside class="sidebar" id="sidebar">
+    <div class="logo"><span class="logo-badge">AI</span><span class="logo-text">aimonitor</span></div>
+
+    <div class="nav-label">监控</div>
+    <button class="nav-item active" data-nav="overview">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="3" width="13" height="10" rx="2"/><path d="M1.5 7h13M5 3v4M11 3v4"/></svg>
+      <span class="t">总览</span> <span class="n" id="nav-overview-count"></span>
+    </button>
+    <button class="nav-item" data-nav="tasks">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 4.5h12M2 8h12M2 11.5h7"/></svg>
+      <span class="t">任务</span> <span class="n" id="nav-tasks-count"></span>
+    </button>
+    <button class="nav-item" data-nav="exec">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="3.5" cy="8" r="1.6"/><circle cx="8" cy="4" r="1.6"/><circle cx="12.5" cy="8" r="1.6"/><circle cx="8" cy="12" r="1.6"/><path d="M4.8 6.8 6.6 5M6.6 11 4.8 9.2M9.4 5l1.8 1.8M9.4 11l1.8-1.8"/></svg>
+      <span class="t">执行流</span>
+    </button>
+    <button class="nav-item" data-nav="trend">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 8.5 6 4l3 3 5-5"/><path d="M11 2h3v3"/></svg>
+      <span class="t">趋势</span>
+    </button>
+    <button class="nav-item" data-nav="alerts">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 1.5 14 4v4c0 3.5-2.5 6-6 6.5-3.5-.5-6-3-6-6.5V4z"/><path d="M6 8l1.5 1.5L10.5 6"/></svg>
+      <span class="t">告警</span> <span class="n" id="nav-alert-count"></span>
+    </button>
+
+    <div class="nav-label">项目</div>
+    <div id="sidebar-projects"></div>
+
+    <div class="sidebar-foot" id="sidebar-foot"></div>
+  </aside>
+
+  <!-- ===== 主内容 ===== -->
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <div class="topbar-left">
+          <button id="menu-toggle" class="btn btn-ghost menu-toggle" title="菜单" aria-label="打开菜单">☰</button>
+          <div>
+            <div class="page-title">总览 <span id="page-title-sub" class="page-title-sub"></span></div>
+            <div class="page-sub" id="page-sub">加载中…</div>
+          </div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="seg" id="range-seg" title="时间范围（趋势图 24h/7d/30d）">
+          <button data-range="24h" class="active">24h</button>
+          <button data-range="7d">7d</button>
+          <button data-range="30d">30d</button>
+        </div>
+        <select id="project-select" title="切换当前项目"></select>
+        <button id="refresh-btn" class="btn" title="立即刷新">⟳ 刷新</button>
+        <button id="theme-toggle" class="btn btn-ghost" title="切换暗色/浅色主题">🌙</button>
+      </div>
+    </div>
+
+    <!-- API 错误横幅（请求失败时显示，保留上次数据） -->
+    <div id="error-banner" class="alert-banner info hidden"></div>
+
+    <!-- 告警横幅（客户端轻量派生；TASK-026 升级为服务端 alerts） -->
+    <div id="alert-banner" class="alert-banner hidden"></div>
+
+    <!-- 指标卡 -->
+    <section id="overview" class="cards"></section>
+
+    <!-- 完成率趋势 / 事件速率（TASK-027：/api/history → 手写 SVG 折线图） -->
+    <section class="panel" id="trend-panel">
+      <div class="panel-head"><h3>完成率趋势 / 事件速率</h3><span class="tool">手写 SVG 折线图 · 数据源 /api/history</span></div>
+      <div id="trend-charts" class="trend-charts">
+        <div class="trend-chart">
+          <div class="trend-chart-head"><span class="trend-chart-title">完成率趋势</span><span class="trend-chart-meta" id="trend-completion-meta"></span></div>
+          <div id="trend-completion" class="trend-svg"><div class="trend-placeholder">加载中…</div></div>
+        </div>
+        <div class="trend-chart">
+          <div class="trend-chart-head"><span class="trend-chart-title">事件速率</span><span class="trend-chart-meta" id="trend-event-meta"></span></div>
+          <div id="trend-event" class="trend-svg"><div class="trend-placeholder">加载中…</div></div>
+        </div>
+      </div>
+      <div id="trend-empty" class="trend-placeholder hidden">暂无历史数据（等待轮询采样）</div>
+    </section>
+
+    <div class="cols">
+      <div class="col-main">
+        <!-- 项目总览表 -->
+        <section class="panel" id="projects-panel">
+          <div class="panel-head"><h3>项目总览</h3><span class="tool" id="project-count"></span></div>
+          <div class="table-wrap">
+            <table id="project-table" class="task-table project-table">
+              <thead>
+                <tr>
+                  <th>项目</th><th>总任务</th><th>完成</th><th>完成率</th>
+                  <th>open</th><th>进行中</th><th>审查中</th><th>阻塞</th>
+                  <th>告警</th><th>心跳</th><th>VERIFY</th><th>REVIEW</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- 任务列表 -->
+        <section class="panel" id="tasks-panel">
+          <div class="panel-head"><h3>任务列表</h3><span class="tool">点击行查看详情</span></div>
+          <div class="filters">
+            <div class="search">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
+              <input id="task-search" type="text" placeholder="搜索任务 / 描述…">
+            </div>
+            <select id="filter-status"><option value="">全部状态</option></select>
+            <select id="filter-priority"><option value="">全部优先级</option></select>
+            <select id="filter-assignee"><option value="">全部 assignee</option></select>
+          </div>
+          <div class="table-wrap">
+            <table id="task-table" class="task-table">
+              <thead>
+                <tr><th>任务</th><th>状态</th><th>优先级</th><th>风险</th><th>assignee</th><th>updated</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <div class="col-side">
+        <!-- 事件时间线（TASK-023 接入完整 API） -->
+        <section class="panel" id="exec-panel">
+          <div class="panel-head"><h3>事件流</h3><span class="tool" id="events-count"></span></div>
+          <div id="events" class="timeline"></div>
+        </section>
+
+        <!-- 当前焦点 -->
+        <section class="panel">
+          <div class="panel-head"><h3>当前焦点</h3></div>
+          <div id="focus" class="focus"></div>
+        </section>
+
+        <!-- 任务状态分布 -->
+        <section class="panel">
+          <div class="panel-head"><h3>任务状态分布</h3></div>
+          <div id="status-bars" class="status-bars"></div>
+          <div id="status-legend" class="status-legend"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ===== 任务详情抽屉 ===== -->
+<aside id="detail-panel" class="detail hidden">
+  <button id="detail-close" class="detail-close" title="关闭">✕</button>
+  <div id="detail-body"></div>
+</aside>
+
+<script src="js/trend.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>

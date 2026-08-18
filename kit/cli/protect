@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# ============================================================
+# protect — 用操作系统文件权限锁 generated_dirs 只读
+#
+# modification-policy.md 说"AI 禁止手动编辑 generated_dirs"，但那只是文档——
+# 任何 AI 工具（不只是 Claude Code）只要没读这份文档，或者读了但"忘了"，
+# 照样能 Write。chmod 是唯一一层跟具体 AI 工具无关、机械生效的强制：
+# 权限位不允许写，任何工具的 Write/Edit 调用在 OS 层面直接失败。
+#
+# 用法:
+#   cli/protect            # 锁 aios.config.yaml 里 generated_dirs 为只读
+#   cli/protect --unlock   # 解锁（生成器重新生成代码前先解锁，生成后再锁回去）
+#
+# 布局兼容：kit/ 子目录布局（<root>/kit/cli/protect）与平铺布局（<root>/cli/protect）
+# 都能向上找到含 aios.config.yaml 的项目根。
+# ============================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# 兼容 kit/ 子目录布局：向上找到含 aios.config.yaml 的项目根
+while [ ! -f "$ROOT/aios.config.yaml" ] && [ "$ROOT" != "/" ]; do
+  ROOT="$(dirname "$ROOT")"
+done
+cd "$ROOT"
+
+MODE="lock"
+if [ "${1:-}" = "--unlock" ]; then
+  MODE="unlock"
+fi
+
+CONFIG="$ROOT/aios.config.yaml"
+if [ ! -f "$CONFIG" ]; then
+  echo "✗ 未找到 $CONFIG" >&2
+  echo "  先从 kit/profiles/<type>/config.template.yaml 复制一份到项目根目录、改名 aios.config.yaml 并填好占位符。" >&2
+  exit 1
+fi
+
+# config lib 定位：kit 布局在 <root>/kit/cli/lib，平铺布局在 <root>/cli/lib
+if [ -d "$ROOT/kit/cli/lib" ]; then
+  LIBDIR="$ROOT/kit/cli/lib"
+else
+  LIBDIR="$ROOT/cli/lib"
+fi
+
+DIRS="$(python3 - "$LIBDIR" "$ROOT" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import config
+cfg = config.load_config(sys.argv[2])
+for d in cfg["generated_dirs"]:
+    print(d)
+PYEOF
+)"
+
+if [ -z "$DIRS" ]; then
+  echo "（generated_dirs 为空，无需处理）"
+  exit 0
+fi
+
+while IFS= read -r d; do
+  [ -z "$d" ] && continue
+  target="$ROOT/$d"
+  if [ ! -e "$target" ]; then
+    echo "· 跳过（尚不存在，等生成器第一次跑完再锁）: $d"
+    continue
+  fi
+  if [ "$MODE" = "lock" ]; then
+    chmod -R a-w "$target"
+    echo "✓ 已锁只读: $d"
+  else
+    chmod -R u+w "$target"
+    echo "✓ 已解锁: $d"
+  fi
+done <<< "$DIRS"

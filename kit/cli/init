@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# ============================================================
+# init — 将 AIOS + Reliable AI Engineering Framework 安装到目标项目
+#        （kit/ 子目录布局：框架内容进 <目标>/kit/，工具配置/入口在项目根）
+#
+# 用法:
+#   bash cli/init [目标项目根目录] [--profile <type>] [--non-interactive]
+#
+#   交互式终端下默认会问 profile 类型 + source_dirs/generated_dirs/
+#   build/lint/test/check 命令，生成实例化好的 aios.config.yaml。
+#   --profile <type>       跳过"选 profile"这一步，直接用该类型
+#   --non-interactive      不问任何问题，把 profile 模板原样复制成
+#                           aios.config.yaml（占位符需要事后手填）；
+#                           非 TTY（CI/脚本）环境下自动等效于此
+#
+# 安装产物（与 cli/mkproject 生成的结构一致，可装进已存在的项目）:
+#   <目标>/kit/             框架（只读，升级时整体替换）
+#   <目标>/AGENTS.md        统一规则入口（25+ 工具原生读取，完整框架导航）
+#   <目标>/CLAUDE.md        → symlink AGENTS.md（Claude Code）
+#   <目标>/.cursor/         Cursor 条件规则（*.mdc）
+#   <目标>/.claude/         Claude Code 路径条件规则 + 本地设置
+#   <目标>/.pi/SYSTEM.md    pi 系统提示词（治理规则注入）
+#   <目标>/.github/         GitHub 工作流（verify.yml）
+#   <目标>/.githooks/       pre-commit/commit-msg（generated_dirs 保护 + TASK 引用 + check）
+#   <目标>/aios.config.yaml 实例化好的项目配置（交互式向导生成）
+#   <目标>/knowledge/ docs/ runtime/（项目可写区 + runtime 模板）
+# ============================================================
+set -euo pipefail
+
+KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 工具配置/项目入口在源仓库根：kit 布局时 = kit/ 的父目录；平铺时 = 框架根自身
+if [ "$(basename "$KIT")" = "kit" ]; then
+  SRC_ROOT="$(dirname "$KIT")"
+else
+  SRC_ROOT="$KIT"
+fi
+TARGET="."
+PROFILE=""
+NONINTERACTIVE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile) PROFILE="$2"; shift 2 ;;
+    --non-interactive) NONINTERACTIVE=1; shift ;;
+    -*) echo "未知参数: $1" >&2; exit 1 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+
+if [ ! -d "$TARGET" ]; then
+  mkdir -p "$TARGET"
+fi
+TARGET="$(cd "$TARGET" && pwd)"
+
+# ---------- 防呆：目标不能是框架源仓库自身或其子目录 ----------
+# 在源仓库里执行 init 会把框架复制进自己（嵌套 kit/kit、框架目录重复、
+# runtime/ 实例区被塞模板），且毫无意义——源仓库已是完整项目。
+case "$TARGET" in
+  "$SRC_ROOT"|"$SRC_ROOT"/*)
+    echo "✗ 目标 $TARGET 位于框架源仓库（$SRC_ROOT）内——不能在这里执行 init。" >&2
+    echo "  init 用于把框架安装到目标项目；源仓库激活 githooks 只需:" >&2
+    echo "    git config core.hooksPath .githooks" >&2
+    exit 1
+    ;;
+esac
+
+echo "═══ AIOS + Reliable AI Engineering Framework 安装 ═══"
+echo "kit     : $KIT"
+echo "target  : $TARGET"
+echo ""
+
+# ---------- 复制框架结构（已存在不覆盖，幂等）----------
+copy_dir() {
+  local src="$1" dst="$2"
+  if [ -d "$src" ]; then
+    mkdir -p "$dst"
+    cp -rn "$src"/* "$dst/" 2>/dev/null || true
+    echo "  ✓ $dst"
+  fi
+}
+
+inst_file() {
+  local src="$1" dst="$2"
+  [ -f "$src" ] && cp -n "$src" "$dst" 2>/dev/null && echo "  ✓ $dst" || true
+}
+
+# runtime/ 混杂了"模板/说明"（README、*.template.md、*_WORKFLOW.md）和
+# "这个 kit 自己开发时产生的任务实例数据"（TASK-001、它的 REVIEW/VERIFY、
+# CURRENT_FOCUS.md、logs/*）。下游项目只该拿到前者，绝不该继承 kit 自己的
+# 任务历史——否则每个新项目里都会平白多出一个别人的 TASK-001。
+copy_runtime_templates() {
+  local src="$1" dst="$2"
+  mkdir -p "$dst"
+  find "$src" -type f \( -name "README.md" -o -name "*.template.md" -o -name "*_WORKFLOW.md" \) \
+    | while IFS= read -r f; do
+        rel="${f#"$src"/}"
+        mkdir -p "$dst/$(dirname "$rel")"
+        cp -n "$f" "$dst/$rel" 2>/dev/null || true
+      done
+  echo "  ✓ $dst（仅模板/说明文件，不含 kit 自己的任务实例数据）"
+}
+
+# ---------- 1. 框架内容 → <目标>/kit/（整目录复制，排除缓存/配置/工具配置） ----------
+mkdir -p "$TARGET/kit"
+find "$KIT" -mindepth 1 -maxdepth 1 \
+  ! -name '__pycache__' ! -name '*.pyc' ! -name '.git' \
+  ! -name '.cursor' ! -name '.claude' ! -name '.pi' ! -name '.github' ! -name '.githooks' \
+  ! -name 'aios.config.yaml' ! -name 'install.sh' ! -name 'install.ps1' ! -name 'cmd-steps.md' \
+  -exec cp -rn {} "$TARGET/kit/" \; 2>/dev/null || true
+# 清掉嵌套缓存（copytree ignore 语义：__pycache__/*.pyc 不进入目标）
+find "$TARGET/kit" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+find "$TARGET/kit" -type f -name '*.pyc' -delete 2>/dev/null || true
+echo "  ✓ $TARGET/kit（框架内容，整目录复制，结构同 mkproject）"
+
+# ---------- 1c. 工具配置目录（.cursor/.claude/.pi/.github/.githooks）→ 项目根 ----------
+#     工具（Cursor/Claude Code/pi/GitHub Actions/git hooks）按项目根读取配置，
+#     因此必须放项目根，不能放 kit/ 内。整目录复制，与 mkproject 一致。
+copy_dir "$SRC_ROOT/.cursor"   "$TARGET/.cursor"
+copy_dir "$SRC_ROOT/.claude"   "$TARGET/.claude"
+copy_dir "$SRC_ROOT/.pi"       "$TARGET/.pi"
+copy_dir "$SRC_ROOT/.github"   "$TARGET/.github"
+copy_dir "$SRC_ROOT/.githooks" "$TARGET/.githooks"
+
+# ---------- 1d. 项目入口文件（AGENTS.md 完整导航 + opencode.md；CLAUDE.md symlink） ----------
+inst_file "$SRC_ROOT/AGENTS.md"   "$TARGET/AGENTS.md"
+inst_file "$SRC_ROOT/opencode.md" "$TARGET/opencode.md"
+# Claude Code: symlink CLAUDE.md → AGENTS.md（官方推荐）
+if [ ! -e "$TARGET/CLAUDE.md" ]; then
+  ln -s AGENTS.md "$TARGET/CLAUDE.md" && echo "  ✓ $TARGET/CLAUDE.md → AGENTS.md"
+fi
+
+# ---------- 2. runtime 模板 + 项目可写区 ----------
+copy_runtime_templates "$KIT/runtime" "$TARGET/runtime"
+for d in knowledge docs; do
+  mkdir -p "$TARGET/$d"
+done
+for d in runtime/tasks runtime/states runtime/executions runtime/reviews runtime/verification runtime/logs runtime/memory; do
+  mkdir -p "$TARGET/$d"
+done
+
+# ---------- 3. aios.config.yaml 实例化 ----------
+CONFIG_DST="$TARGET/aios.config.yaml"
+if [ -f "$CONFIG_DST" ]; then
+  echo "  · aios.config.yaml 已存在，不覆盖"
+else
+  AVAILABLE_PROFILES="$(find "$KIT/profiles" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+
+  if [ -z "$PROFILE" ] && [ "$NONINTERACTIVE" = "0" ] && [ -t 0 ]; then
+    echo ""
+    echo "选择项目类型 profile："
+    select p in $AVAILABLE_PROFILES; do
+      if [ -n "$p" ]; then PROFILE="$p"; break; fi
+      echo "无效选择，重新来"
+    done
+  fi
+
+  if [ -z "$PROFILE" ]; then
+    echo "  · 未指定 profile，跳过 aios.config.yaml 生成"
+    echo "    可选: $(echo "$AVAILABLE_PROFILES" | tr '\n' ' ')"
+    echo "    后续手动复制 kit/profiles/<type>/config.template.yaml 为 aios.config.yaml 并填好"
+  else
+    TEMPLATE_SRC="$KIT/profiles/$PROFILE/config.template.yaml"
+    if [ ! -f "$TEMPLATE_SRC" ]; then
+      echo "  ✗ 未知 profile: $PROFILE（可选: $(echo "$AVAILABLE_PROFILES" | tr '\n' ' ')）" >&2
+      exit 1
+    fi
+    if [ "$NONINTERACTIVE" = "1" ] || [ ! -t 0 ]; then
+      cp "$TEMPLATE_SRC" "$CONFIG_DST"
+      echo "  ✓ $CONFIG_DST（$PROFILE 模板原样复制，占位符 <...> 需要手动填）"
+    else
+      python3 "$KIT/cli/lib/init_wizard.py" "$TEMPLATE_SRC" "$CONFIG_DST" "$PROFILE"
+    fi
+  fi
+fi
+
+# ---------- 4. 锁 generated_dirs 只读 + githooks ----------
+if [ -f "$CONFIG_DST" ]; then
+  (cd "$TARGET" && bash kit/cli/protect 2>/dev/null) || true
+fi
+
+chmod +x "$TARGET"/.githooks/* 2>/dev/null || true
+if [ -d "$TARGET/.git" ]; then
+  (cd "$TARGET" && git config core.hooksPath .githooks)
+  echo "  ✓ git config core.hooksPath .githooks（pre-commit/commit-msg 已生效）"
+else
+  echo "  · $TARGET 还不是 git 仓库：git init 之后手动跑一次"
+  echo "    git config core.hooksPath .githooks"
+fi
+
+# ---------- 5. 简易 .gitignore（仅当项目还没有时生成，与 mkproject 结构一致） ----------
+if [ ! -f "$TARGET/.gitignore" ]; then
+  cat > "$TARGET/.gitignore" <<'EOF'
+runtime/tasks/*
+runtime/logs/*
+runtime/verification/*
+runtime/reviews/*
+runtime/memory/*
+.env
+__pycache__/
+EOF
+  echo "  ✓ .gitignore（新建，已存在则保留项目自己的）"
+fi
+
+echo ""
+echo "═══ 安装完成 ═══"
+echo "入口文件:"
+echo "  kit/          — 框架（只读，升级时整体替换）"
+echo "  AGENTS.md     — 统一入口（pi/OpenCode/Qwen Code/Cursor/Copilot 原生读取）"
+echo "  CLAUDE.md     — symlink → AGENTS.md（Claude Code）"
+echo "  .pi/SYSTEM.md — pi 系统提示词（治理规则注入）"
+echo ""
+echo "下一步:"
+if [ -f "$CONFIG_DST" ]; then
+  echo "  1. 检查/补全 aios.config.yaml（尤其留空的 commands.*）"
+else
+  echo "  1. 复制 kit/profiles/<type>/config.template.yaml 为项目根目录 aios.config.yaml 并填好（刚才跳过了实例化）"
+fi
+echo "  2. bash kit/cli/task new \"第一个任务\""
+echo "  3. AI agent 读 AGENTS.md 进入工作流；跑 kit/cli/task verify TASK-xxx 生成真实 VERIFY 记录（不是手写）"

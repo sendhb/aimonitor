@@ -1,0 +1,45 @@
+{
+  "poll_interval_seconds": 30,
+  "heartbeat_stale_threshold_seconds": 900,
+  "history_retention_days": 90,
+  "alert_blocked_ratio_threshold": 0.2,
+  "alert_stale_task_days": 14,
+  "ingest_rate_limit_per_minute": 60,
+  "projects": [
+    {
+      "id": "aimonitor",
+      "name": "aimonitor",
+      "path": "/home/hb/code/aimonitor"
+    },
+    {
+      "id": "aibase",
+      "name": "aibase",
+      "path": "/home/hb/code/aibase"
+    },
+    {
+      "id": "westhill",
+      "name": "westhill",
+      "path": "/home/hb/code/story/westhill"
+    },
+    {
+      "id": "x1design",
+      "name": "x1design",
+      "path": "/home/hb/code/x1design"
+    },
+    {
+      "id": "account-1",
+      "name": "account-1",
+      "path": "/home/hb/code/account"
+    },
+    {
+      "id": "x1-prototype",
+      "name": "x1-prototype",
+      "path": "/home/hb/code/x1-prototype"
+    },
+    {
+      "id": "baseline",
+      "name": "baseline",
+      "path": "/home/hb/code/baseline"
+    }
+  ]
+}

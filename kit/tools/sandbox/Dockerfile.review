@@ -1,0 +1,30 @@
+# 审查专用沙箱镜像 —— 在基础隔离镜像之上安装 AI agent CLI
+#
+# 用途：供 cli/autoloop-{coder,reviewer} --unattended 在隔离容器内执行无人值守审查。
+#
+# 设计原则：
+# - 基础镜像 aios-sandbox 保持"工具无关"（它是隔离沙箱，不是某 AI 工具专属）
+# - 本镜像叠加 Claude Code + DeepSeek TUI，是"审查场景专用"层
+# - 运行时仍由 cli/sandbox-run 控制网络/挂载；本镜像只负责"有 agent CLI 可用"
+#
+# 构建：docker build -f tools/sandbox/Dockerfile.review -t aios-sandbox-review tools/sandbox/
+
+FROM aios-sandbox:latest
+
+# node 20+（pi agent 需要；aios-sandbox 默认 18）
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @anthropic-ai/claude-code@2.1.220 \
+    && npm cache clean --force
+
+RUN npm install -g codewhale@0.9.3 \
+    && npm install -g @earendil-works/pi-coding-agent@0.74.1 \
+    && npm cache clean --force
+
+# 触发 codewhale binary 下载（预缓存到镜像层，跑审查时无需再下载 47MB）
+RUN codewhale --help >/dev/null
+
+# 验证两个 agent CLI 都可用
+RUN claude --version && codewhale exec --auto --help >/dev/null && echo "agent CLI OK"

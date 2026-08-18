@@ -1,0 +1,9 @@
+---
+description: Generated/codegen directories — never edit manually
+globs: gen/**,src/generated/**,dist/**,build/**,Library/**,Temp/**,Binaries/**,Intermediate/**
+---
+# DO NOT EDIT THESE FILES
+
+Files in this directory are **code-generated**. Changes will be overwritten on next generation.
+
+→ Edit the spec/config source instead, then regenerate.

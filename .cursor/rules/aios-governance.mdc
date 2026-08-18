@@ -1,0 +1,24 @@
+---
+description: AIOS Framework governance — applies to all files
+globs: **/*
+---
+# AIOS Governance Protocol
+
+This project uses the AIOS + Reliable AI Engineering Framework.
+
+**Before any action, check:**
+1. `aios/governance/task-policy.md` — task lifecycle
+2. `aios/governance/modification-policy.md` — what files you can/cannot edit
+3. `aios/governance/security-policy.md` — security red lines
+4. `aios/governance/risk-policy.md` — risk levels (P0-P3)
+
+**Red lines (DO NOT):**
+- Edit files in `generated_dirs`
+- Modify P0-risk files (database/payment/auth) without human approval
+- Skip the Plan → Impact → Execute → Reflect → Verify → Repair loop
+- Act as both Coder and Reviewer in the same session
+
+**Standard workflow entry:**
+- Read `AGENTS.md` for navigation
+- Use `cli/task` for task management
+- Follow `aios/execution/engine.md` for execution loop

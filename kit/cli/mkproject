@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mkproject — 用 kit/ 子目录布局创建新项目
+
+把框架内容装到 <project>/kit/ 子目录（只读，可整体升级），
+项目自己的内容（knowledge/ docs/ tables/ src/）留在项目根。
+
+用法:
+  cli/mkproject <project-dir> [--profile backend|design|...] [--from <kit-root>]
+  cli/mkproject ~/code/my-project --profile design
+
+生成的结构:
+  <project>/
+  ├── kit/                  # 框架（只读，升级时整体替换）
+  │   ├── aios/ agents/ cli/ profiles/ tools/ knowledge/ docs/
+  │   └── runtime/          # runtime 模板
+  ├── knowledge/            # 项目知识库（可写，项目专属）
+  ├── docs/                 # 项目文档
+  ├── tables/               # 项目数据（按 profile 需要）
+  ├── runtime/              # 运行数据（tasks/states/logs）
+  ├── aios.config.yaml      # 项目配置
+  └── AGENTS.md             # 完整框架导航（工具按项目根读取）
+"""
+import argparse
+import os
+import shutil
+import sys
+import subprocess
+
+# 本文件位于 <kit>/cli/mkproject，kit 源仓库根 = 向上两级
+# aibase 自身也是 kit/ 子目录布局，框架内容在 <kit_root>/kit/，与项目保持一致
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROFILES = ["backend", "game-server", "unity", "unreal", "frontend", "data", "novel", "design"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="创建 kit/ 子目录布局的新项目")
+    ap.add_argument("project_dir", help="新项目目录")
+    ap.add_argument("--profile", default=None, choices=PROFILES,
+                    help=f"项目类型（{', '.join(PROFILES)}）")
+    ap.add_argument("--from", dest="kit_root", default=KIT,
+                    help="kit 源目录（默认本仓库）")
+    args = ap.parse_args()
+
+    kit_root = os.path.abspath(args.kit_root)
+    project = os.path.abspath(args.project_dir)
+    if not os.path.isdir(kit_root):
+        sys.exit(f"✗ kit 源不存在: {kit_root}")
+    if os.path.exists(project) and os.listdir(project):
+        sys.exit(f"✗ 目标目录非空: {project}")
+    os.makedirs(project, exist_ok=True)
+
+    # 1. 复制框架到 <project>/kit/（整目录拷贝，与 aibase 的 kit/ 完全一致）
+    #    kit_root 即"框架内容根"：平铺时=aibase 根；kit 布局时=aibase/kit
+    src_kit = kit_root
+    if not os.path.isdir(src_kit):
+        sys.exit(f"✗ kit 源不存在: {src_kit}")
+    dest_kit = os.path.join(project, "kit")
+    # 整目录复制但排除：项目配置（在项目根）、git、缓存
+    shutil.copytree(src_kit, dest_kit, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        "__pycache__", "*.pyc", ".git",
+                        "aios.config.yaml", "install.sh", "install.ps1", "cmd-steps.md",
+                        ".cursor", ".claude", ".pi", ".github", ".githooks"))
+    print("  ✓ kit/（整目录复制，结构与 aibase 一致）")
+
+    # 1c. 工具配置目录（.cursor/.claude/.pi/.github/.githooks）→ 项目根
+    #     工具（Cursor/Claude Code/pi/GitHub Actions/git hooks）按项目根读取配置，
+    #     因此必须放项目根，不能放 kit/ 内。
+    #     --from 传的是框架内容根（aibase/kit/）；工具配置在源仓库根（aibase/）。
+    src_tools_root = os.path.dirname(kit_root) if os.path.basename(kit_root) == "kit" else kit_root
+    for td in [".cursor", ".claude", ".pi", ".github", ".githooks"]:
+        tsrc = os.path.join(src_tools_root, td)
+        if os.path.isdir(tsrc):
+            shutil.copytree(tsrc, os.path.join(project, td), dirs_exist_ok=True)
+            print(f"  ✓ {td}/（项目根）")
+
+    # 2. 项目根目录结构（可写内容）
+    for d in ["knowledge", "docs", "runtime"]:
+        os.makedirs(os.path.join(project, d), exist_ok=True)
+    for sub in ["tasks", "states", "executions", "reviews", "verification", "logs", "memory"]:
+        os.makedirs(os.path.join(project, "runtime", sub), exist_ok=True)
+
+    # 2b. runtime 模板文件（TASK.template.md / VERIFY.template.md 等）从 kit/runtime 复制
+    #     只复制模板/说明，不复制实例（对应 copy_runtime_templates）
+    src_runtime = os.path.join(kit_root, "runtime")
+    if os.path.isdir(src_runtime):
+        for root, _, files in os.walk(src_runtime):
+            for f in files:
+                if f.endswith(".template.md") or f == "README.md" or f.endswith("_WORKFLOW.md"):
+                    rel = os.path.relpath(os.path.join(root, f), src_runtime)
+                    out = os.path.join(project, "runtime", rel)
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    shutil.copy(os.path.join(root, f), out)
+        print("  ✓ runtime/ 模板文件（TASK/VERIFY/REVIEW 模板）")
+
+    # 3. aios.config.yaml（有 profile → 从 kit/profiles 模板复制；无 profile → 从源仓库根复制）
+    if args.profile:
+        cfg_src = os.path.join(src_kit, "profiles", args.profile, "config.template.yaml")
+    else:
+        cfg_src = os.path.join(src_tools_root, "aios.config.yaml")
+    if os.path.isfile(cfg_src):
+        shutil.copy(cfg_src, os.path.join(project, "aios.config.yaml"))
+        print(f"  ✓ aios.config.yaml（profile: {args.profile or 'kit 自举'}）")
+        if args.profile:
+            print("    ⚠ 记得把 <...> 占位符填成真实命令")
+
+    # 4. 项目根 AGENTS.md：从源仓库根复制完整框架导航（工具按项目根读取，非薄指针）
+    src_agents = os.path.join(src_tools_root, "AGENTS.md")
+    if os.path.isfile(src_agents):
+        shutil.copy(src_agents, os.path.join(project, "AGENTS.md"))
+        print("  ✓ AGENTS.md（完整框架导航）")
+    else:
+        # 回退：生成最小入口（不依赖源仓库根的 AGENTS.md）
+        agents_content = f"""# AGENTS.md — {os.path.basename(project)} 项目入口
+
+> 本项目基于 AIOS Framework。框架规则全部在 `kit/` 内（只读，可整体升级）。
+
+## 快速导航
+
+1. [`kit/aios/governance/`](kit/aios/governance/) — 治理协议
+2. [`kit/agents/README.md`](kit/agents/README.md) — 角色定义
+3. [`kit/aios/execution/engine.md`](kit/aios/execution/engine.md) — 执行闭环
+
+## 升级 kit
+
+整体替换 `kit/` 目录即可，`knowledge/`/`docs/`/`aios.config.yaml` 不受影响。
+"""
+        with open(os.path.join(project, "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write(agents_content)
+        print("  ✓ AGENTS.md（回退最小入口）")
+
+    # 4b. 入口文件对齐（与 cli/init 安装产物一致）：opencode.md + CLAUDE.md symlink
+    src_opencode = os.path.join(src_tools_root, "opencode.md")
+    if os.path.isfile(src_opencode):
+        shutil.copy(src_opencode, os.path.join(project, "opencode.md"))
+        print("  ✓ opencode.md（项目根）")
+    claude_link = os.path.join(project, "CLAUDE.md")
+    if not os.path.lexists(claude_link):
+        os.symlink("AGENTS.md", claude_link)
+        print("  ✓ CLAUDE.md → AGENTS.md")
+    elif not os.path.islink(claude_link):
+        print("  · CLAUDE.md 已存在且非 symlink，保留不动")
+
+    # 5. 简易 .gitignore
+    gi = "runtime/tasks/*\nruntime/logs/*\nruntime/verification/*\nruntime/reviews/*\nruntime/memory/*\n.env\n__pycache__/\n"
+    with open(os.path.join(project, ".gitignore"), "w", encoding="utf-8") as f:
+        f.write(gi)
+
+    print(f"\n✓ 项目已创建: {project}")
+    print("  下一步:")
+    print(f"    cd {project}")
+    print("    git init && git config core.hooksPath .githooks   # 如需 githooks")
+    print("    kit/cli/task new \"第一个任务\" --priority P2 --risk P2")
+
+
+if __name__ == "__main__":
+    main()

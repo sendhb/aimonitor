@@ -1,0 +1,30 @@
+version: 1
+profile: design
+source_dirs:
+  - docs/
+  - tables/
+generated_dirs:
+  - output/
+commands:
+  build: <build-command>
+  lint: <lint-command>
+  test: <test-command>
+  check: <check-command>
+
+# ---- 启动命令（可选；工程有启动入口时取消注释并填真实命令）----
+# 约定：design 工程通常是文档/表格工作流，启动入口多为校验/导出脚本；
+#       命令登记在此处后，AI 通过 aios.config.yaml 即可发现并调用
+#       （cli/lib/config.py 保留 commands 额外键，不限于 build/lint/test/check）。
+# commands:
+#   start: <校验/导出/生成脚本入口，如有>
+
+# ---- SDD 扩展字段（仅当任务命中 aios/execution/sdd-workflow.md 场景 A' 时需要，取消注释并按需修改）----
+# project:
+#   kind: tool-software
+# spec:
+#   type: docs
+# docs:
+#   domains: docs/domains/         # 功能规格（玩法/系统/设定规则）
+#   flows: docs/flows/             # 交互流程（玩家操作步骤/系统流程）
+#   design: docs/design/           # 设计文档（玩法/数值/世界观，如有）
+#   screenshots: docs/screenshots/ # 功能验证截图（如有）

@@ -1,0 +1,30 @@
+version: 1
+profile: game-server
+source_dirs:
+  - src/
+generated_dirs:
+  - dist/
+commands:
+  build: <build-command>
+  lint: <lint-command>
+  test: <test-command>
+  check: <check-command>
+
+# ---- 启动命令（可选；工程有启动入口时取消注释并填真实命令）----
+# 约定：启动脚本放 source_dirs 指向的源码区（如 cmd/、bin/），
+#       命令登记在此处后，AI 通过 aios.config.yaml 即可发现并调用
+#       （cli/lib/config.py 保留 commands 额外键，不限于 build/lint/test/check）。
+# commands:
+#   start: <启动命令，如 go run ./cmd/gateway>
+#   dev:   <开发模式命令，如 air>
+
+# ---- SDD 扩展字段（仅当任务命中 aios/execution/sdd-workflow.md 场景 A" 时需要，取消注释并按需修改）----
+# project:
+#   kind: game-network
+# spec:
+#   type: protocol
+# docs:
+#   protocol: docs/protocol/       # 消息定义、封包格式、交互序列（客户端/服务器共同契约）
+#   domains: docs/domains/         # 玩法规格（该玩法用到的消息）
+# commands:
+#   generate: <协议编解码代码生成命令，如有>

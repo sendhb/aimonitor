@@ -1,0 +1,28 @@
+version: 1
+profile: novel
+source_dirs:
+  - src/
+generated_dirs:
+  - output/
+commands:
+  build: <build-command>
+  lint: <lint-command>
+  test: <test-command>
+  check: <check-command>
+
+# ---- 启动命令（可选；工程有启动入口时取消注释并填真实命令）----
+# 约定：novel 工程通常无服务启动入口；如有 CLI 工具/生成脚本入口，登记在此处，
+#       命令登记后 AI 通过 aios.config.yaml 即可发现并调用
+#       （cli/lib/config.py 保留 commands 额外键，不限于 build/lint/test/check）。
+# commands:
+#   start: <生成/续写脚本入口，如有>
+
+# ---- SDD 扩展字段（仅当任务命中 aios/execution/sdd-workflow.md 场景 A' 时需要，取消注释并按需修改）----
+# project:
+#   kind: tool-software
+# spec:
+#   type: docs
+# docs:
+#   domains: docs/domains/         # 设定规格（世界观、人物、大纲）
+#   flows: docs/flows/             # 情节流程（章节/时间线约束）
+#   design: docs/design/           # 风格/文风规范（如有）

@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ====================================================================
+# 本脚本是 Python 3。请勿用 bash/sh 直接调用（如 `bash kit/cli/task`）：
+# bash 会把 Python 源码当 shell 逐行解析，产生巨量错误输出（实测一次误调用
+# 可产生 274 万行 / 109MB 输出）甚至 `fork: Resource temporarily unavailable`，
+# LLM 看到失败后反复重试 → 死循环（TASK-031 根因）。
+# 正确调用：./kit/cli/task <子命令>  或  python3 kit/cli/task <子命令>
+#
+# 下面两行是【bash/Python 双语法】防护（勿改动、勿合并）：
+#   - Python：相邻字符串字面量隐式拼接，作为无副作用表达式（no-op）；
+#   - bash/sh/zsh：`echo` 打印错误提示，`exit 1` 立即退出，
+#     不会继续解析后面的 Python 源码 —— 从根上杜绝 bash 误调用死循环。
+# ====================================================================
+"echo" "✗ 本脚本是 Python 3，请勿用 bash/sh 调用（bash 会把 Python 源码当 shell 逐行解析）。正确用法: ./kit/cli/task <子命令> 或 python3 kit/cli/task <子命令>"
+"exit" "1"
+USAGE = """task — 任务追踪 CLI（AIOS + Reliable AI Engineering Framework）
+================================================
+固定格式任务文件（runtime/tasks/TASK-xxx.md）+ 状态机管理。
+
+用法:
+  task new "描述" [--slug <slug>] [--priority P1] [--risk P2] [--approval-ref none] [--assignee any] [--reviewer any] [--parent TASK-000]
+  task list [status]
+  task show TASK-001
+  task start TASK-001
+  task verify TASK-001
+  task review TASK-001
+  task approve TASK-001
+  task done TASK-001 [--force]
+  task block TASK-001 "原因"
+  task unblock TASK-001
+  task cancel TASK-001
+  task validate
+  task index
+  task stats
+  task help
+"""
+import os
+import re
+import sys
+import datetime
+import shutil
+import subprocess
+
+
+def find_project_root(start):
+    """从脚本位置向上寻找项目根（含 aios.config.yaml 的目录）。
+
+    兼容两种布局：
+      - 平铺：<root>/cli/task （当前库自举，向上 2 级）
+      - kit 子目录：<root>/kit/cli/task（向上 3 级）
+    以 aios.config.yaml 所在目录为准，避免硬编码层级。
+    """
+    d = os.path.dirname(os.path.abspath(start))
+    while True:
+        if os.path.isfile(os.path.join(d, "aios.config.yaml")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    # 回退：向上两级（kit/cli/task → repo root 的兼容层）
+    return os.path.dirname(os.path.dirname(os.path.abspath(start)))
+
+
+AI_DIR = find_project_root(__file__)
+RUNTIME_DIR = os.path.join(AI_DIR, "runtime")
+TASKS_DIR = os.path.join(RUNTIME_DIR, "tasks")
+STATE_DIR = os.path.join(RUNTIME_DIR, "states")
+VERIFY_DIR = os.path.join(RUNTIME_DIR, "verification")
+REVIEW_DIR = os.path.join(RUNTIME_DIR, "reviews")
+LOG_DIR = os.path.join(RUNTIME_DIR, "logs")
+TEMPLATE = os.path.join(RUNTIME_DIR, "tasks", "TASK.template.md")
+# kit 布局：模板在 kit/runtime/tasks/，项目根 runtime 只有实例。
+# 模板缺失时回退到 kit/runtime/（若存在），保证新建任务可用。
+KIT_RUNTIME_TEMPLATE = os.path.join(AI_DIR, "kit", "runtime", "tasks", "TASK.template.md")
+if not os.path.exists(TEMPLATE) and os.path.exists(KIT_RUNTIME_TEMPLATE):
+    TEMPLATE = KIT_RUNTIME_TEMPLATE
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+import config as cfg_lib  # noqa: E402
+
+STATUSES = ["open", "in-progress", "in-review", "blocked", "done", "cancelled"]
+TRANSITIONS = {
+    "open": ["in-progress", "blocked", "cancelled"],
+    "in-progress": ["in-review", "done", "blocked", "cancelled"],
+    "in-review": ["done", "in-progress", "blocked"],
+    "blocked": ["in-progress"],
+    "done": [],
+    "cancelled": [],
+}
+TASK_RE = re.compile(r"^TASK-(\d{3})-[a-z0-9-]+\.md$")
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def parse_frontmatter(text):
+    """返回 (flat_dict, body_start_index)。flat_dict 键如 'name', 'metadata.status'。"""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, 0
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return None, 0
+    fm, section = {}, None
+    for line in lines[1:end]:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", s)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if key == "metadata":
+            section = "metadata"
+            continue
+        if val == "":
+            continue
+        if val.startswith("[") and val.endswith("]"):
+            val = val[1:-1].split(",") if val[1:-1].strip() else []
+            val = [v.strip() for v in val]
+        full = f"{section}.{key}" if section else key
+        fm[full] = val
+    return fm, end
+
+
+def load_task(path):
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    fm, _ = parse_frontmatter(text)
+    return text, fm
+
+
+def task_files():
+    if not os.path.isdir(TASKS_DIR):
+        return []
+    return sorted(f for f in os.listdir(TASKS_DIR) if TASK_RE.match(f))
+
+
+def find_task(task_id):
+    for f in task_files():
+        if f.startswith(task_id + "-") or f == task_id + ".md":
+            return os.path.join(TASKS_DIR, f)
+    return None
+
+
+def set_status(path, new_status, force=False, require_review=False):
+    text, fm = load_task(path)
+    if fm is None:
+        die(f"frontmatter 缺失或损坏: {path}")
+    cur = fm.get("metadata.status")
+    if cur == new_status:
+        print(f"已是 {new_status}: {os.path.basename(path)}")
+        return
+    if not force and new_status not in TRANSITIONS.get(cur or "", []):
+        die(f"非法状态转换: {cur} → {new_status}（允许: {TRANSITIONS.get(cur or '', [])}）")
+    if new_status == "done" and not force:
+        # 处于 in-review 的任务直接 done 也强制要求审查记录
+        check_done_prereqs(path, fm, require_review=require_review or cur == "in-review")
+    lines = text.splitlines()
+    out = []
+    updated = False
+    for line in lines:
+        if re.match(r"^\s*status:\s*", line) and not updated:
+            out.append(f"  status: {new_status}")
+            updated = True
+            continue
+        if re.match(r"^\s*updated:\s*", line):
+            out.append(f"  updated: {today()}")
+            continue
+        out.append(line)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+    print(f"✓ {os.path.basename(path)} → {new_status}")
+
+
+def check_done_prereqs(path, fm, require_review=False):
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    unchecked = [l for l in text.splitlines() if re.match(r"^\s*- \[ \]", l)]
+    if unchecked:
+        die(f"还有 {len(unchecked)} 条验收标准未勾选:\n" + "\n".join("  " + l.strip() for l in unchecked[:8]))
+    ref = fm.get("name")
+    name = os.path.basename(path)[:-3]
+    if not (ref and verify_exists(ref)) and not verify_exists(name):
+        die(f"未找到引用 {ref or name} 的 VERIFY 记录（runtime/verification/）。先写验证记录，或加 --force。")
+    # 审查前置：任务处于 in-review，或 reviewer 明确指定（非 any/none/空）时，必须有 REVIEW 记录
+    risk = (fm.get("metadata.risk") or "P2").upper()
+    if risk == "P0" and (fm.get("metadata.approval-ref") or "none").strip().lower() in ("", "none", "n/a"):
+        die(f"{ref or name}: P0 任务缺少人工批准引用 metadata.approval-ref")
+    reviewer = (fm.get("metadata.reviewer") or "any").strip()
+    priority = (fm.get("metadata.priority") or "P2").upper()
+    needs_review = require_review or risk in ("P0", "P1") or priority in ("P0", "P1") or reviewer not in ("", "any", "none")
+    if needs_review and not (ref and review_exists(ref, fm)) and not review_exists(name, fm):
+        why = "任务处于 in-review" if require_review else f"reviewer={reviewer}"
+        die(f"{ref or name}: {why}，但未找到 REVIEW 记录（runtime/reviews/ 中 task-ref 引用）。"
+            f"先写审查记录（task review → runtime/reviews/REVIEW-xxx.md → task approve），或加 --force。")
+
+
+def short_id(ref):
+    m = re.match(r"^(TASK-\d{3})", ref or "")
+    return m.group(1) if m else None
+
+
+def evidence_exists(directory, prefix, ref, record_type, ref_date=None):
+    """Return true only for a current, passing, well-formed evidence record.
+
+    ref_date: 证据日期必须匹配的日期（默认 today()）。校验 done 任务时传任务
+    metadata.updated（完成当天），避免历史任务被“运行日”误判；done/approve
+    路径发生在当下，仍用 today()。
+    """
+    if not os.path.isdir(directory):
+        return False
+    short = short_id(ref)
+    ref_date = ref_date or today()
+    for filename in os.listdir(directory):
+        if not filename.startswith(prefix) or not filename.endswith(".md"):
+            continue
+        path = os.path.join(directory, filename)
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+        if not raw.lstrip().startswith("---"):
+            continue
+        fm, _ = parse_frontmatter(raw)
+        if not fm or fm.get("metadata.type") != record_type:
+            continue
+        # required fields: name, description, date, task-ref, result
+        if not fm.get("name") or not fm.get("description"):
+            continue
+        if not fm.get("metadata.verifier") or not fm.get("metadata.commit"):
+            continue
+        if fm.get("metadata.date") != ref_date or fm.get("metadata.result") != "pass":
+            continue
+        task_ref = fm.get("metadata.task-ref", "")
+        if task_ref == ref or (short and task_ref == short):
+            return fm
+    return False
+
+
+def verify_exists(ref, ref_date=None):
+    return bool(evidence_exists(VERIFY_DIR, "VERIFY-", ref, "verify", ref_date))
+
+
+def review_exists(ref, task_fm=None, ref_date=None):
+    if not os.path.isdir(REVIEW_DIR):
+        return False
+    short = short_id(ref)
+    task_author = ((task_fm or {}).get("metadata.assignee") or "").strip()
+    ref_date = ref_date or today()
+    for filename in os.listdir(REVIEW_DIR):
+        if not filename.startswith("REVIEW-") or not filename.endswith(".md"):
+            continue
+        with open(os.path.join(REVIEW_DIR, filename), encoding="utf-8") as fh:
+            fm, _ = parse_frontmatter(fh.read())
+        if not fm or fm.get("metadata.type") != "review":
+            continue
+        if fm.get("metadata.date") != ref_date or fm.get("metadata.result") != "pass":
+            continue
+        task_ref = fm.get("metadata.task-ref", "")
+        if task_ref != ref and not (short and task_ref == short):
+            continue
+        reviewer = (fm.get("metadata.reviewer") or "").strip()
+        author = (fm.get("metadata.implementation-author") or "").strip()
+        if reviewer and author and reviewer != author and (not task_author or task_author == "any" or reviewer != task_author):
+            return True
+    return False
+
+def die(msg, code=1):
+    print(f"✗ {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------- 命令实现 ----------------
+
+def cmd_new(args):
+    if not args:
+        die("用法: task new \"描述\" [--slug x] [--priority P1] [--risk P2] [--approval-ref none] [--assignee any] [--reviewer any] [--parent TASK-000]")
+    desc = args[0]
+    opts = {}
+    i = 1
+    while i < len(args):
+        if args[i].startswith("--") and i + 1 < len(args):
+            opts[args[i]] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    slug = opts.get("--slug", "")
+    if not slug:
+        slug = re.sub(r"[^a-z0-9]+", "-", desc.lower()).strip("-")
+        if not slug:
+            slug = "task"
+    nums = [int(TASK_RE.match(f).group(1)) for f in task_files() if TASK_RE.match(f)]
+    num = (max(nums) + 1) if nums else 1
+    task_id = f"TASK-{num:03d}"
+    name = f"{task_id}-{slug}"
+    path = os.path.join(TASKS_DIR, name + ".md")
+    if os.path.exists(path):
+        die(f"已存在: {path}")
+    template = open(TEMPLATE, encoding="utf-8").read() if os.path.exists(TEMPLATE) else ""
+    if not template:
+        die("模板缺失: runtime/tasks/TASK.template.md")
+    now = today()
+    body = (template
+            .replace("TASK-000-<slug>", name)
+            .replace("一句话说明任务目标", desc)
+            .replace("  status: open", f"  status: open")
+            .replace("  created: YYYY-MM-DD", f"  created: {now}")
+            .replace("  updated: YYYY-MM-DD", f"  updated: {now}")
+            .replace("  priority: P2", f"  priority: {opts.get('--priority', 'P2')}")
+            .replace("  risk: P2", f"  risk: {opts.get('--risk', 'P2')}")
+            .replace("  approval-ref: none", f"  approval-ref: {opts.get('--approval-ref', 'none')}")
+            .replace("  assignee: any", f"  assignee: {opts.get('--assignee', 'any')}")
+            .replace("  reviewer: any", f"  reviewer: {opts.get('--reviewer', 'any')}"))
+    if opts.get("--parent"):
+        body = body.replace("  parent: TASK-000", f"  parent: {opts['--parent']}")
+    body = body.replace("TASK-000 — 任务标题", f"{task_id} — {desc}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    print(f"✓ 已创建 {name}.md")
+    print(f"  编辑: {path}")
+    print(f"  开始: task start {task_id}")
+
+
+def cmd_list(args):
+    status = args[0] if args else None
+    rows = []
+    for f in task_files():
+        _, fm = load_task(os.path.join(TASKS_DIR, f))
+        if fm is None:
+            rows.append((f, "?", "?", "?"))
+            continue
+        st = fm.get("metadata.status", "?")
+        if status and st != status:
+            continue
+        rows.append((f[:-3], st, fm.get("metadata.priority", "-"),
+                     str(fm.get("description", "")).split("\n")[0][:50]))
+    if not rows:
+        print("（无任务）")
+        return
+    print(f"{'任务':<30} {'状态':<12} {'优先级':<4} 描述")
+    for r in sorted(rows):
+        print(f"{r[0]:<30} {r[1]:<12} {r[2]:<4} {r[3]}")
+
+
+def cmd_show(args):
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    print(open(path, encoding="utf-8").read())
+
+
+def cmd_start(args):
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    set_status(path, "in-progress")
+    touch_focus(args[0])
+
+
+def _git_commit():
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                               cwd=AI_DIR, capture_output=True, text=True)
+        out = proc.stdout.strip()
+        return out if proc.returncode == 0 and out else "n/a"
+    except FileNotFoundError:
+        return "n/a"
+
+
+def cmd_verify(args):
+    """真正执行 config.commands.build/lint/test/check（不是查文件形状），全部通过才写 VERIFY 记录。"""
+    if not args:
+        die("用法: task verify TASK-xxx")
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    _, fm = load_task(path)
+    task_id = short_id(fm.get("name") if fm else None) or short_id(args[0]) or args[0]
+
+    try:
+        cfg = cfg_lib.load_config(AI_DIR)
+    except cfg_lib.ConfigError as e:
+        die(str(e))
+
+    steps = ["build", "lint", "test", "check"]
+    transcript = [f"# Verify — {task_id} — {datetime.datetime.now().isoformat()}", ""]
+    for step in steps:
+        cmd = cfg["commands"][step]
+        print(f"▶ {step}: {cmd}")
+        transcript.append(f"$ {cmd}   # {step}")
+        proc = subprocess.run(cmd, shell=True, cwd=AI_DIR, capture_output=True, text=True)
+        transcript.append(proc.stdout)
+        transcript.append(proc.stderr)
+        if proc.returncode != 0:
+            transcript.append(f"✗ {step} 失败（exit {proc.returncode}）")
+            os.makedirs(LOG_DIR, exist_ok=True)
+            fail_log = os.path.join(LOG_DIR, f"fail-{today()}.log")
+            with open(fail_log, "a", encoding="utf-8") as f:
+                f.write("\n".join(transcript) + "\n\n")
+            die(f"{step} 未通过，详情见 {os.path.relpath(fail_log, AI_DIR)}")
+
+    commit = _git_commit()
+    verify_name = f"VERIFY-{today()}-{task_id.lower()}"
+    rows = "\n".join(f"| {s} | `{cfg['commands'][s]}` | ✅ |" for s in steps)
+    body = (
+        "---\n"
+        f"name: {verify_name}\n"
+        f"description: 自动验证 {task_id}（build/lint/test/check 全部通过，非自证）\n"
+        "metadata:\n"
+        "  type: verify\n"
+        f"  date: {today()}\n"
+        f"  task-ref: {task_id}\n"
+        "  verifier: cli/task-verify\n"
+        "  result: pass\n"
+        f"  commit: {commit}\n"
+        "---\n\n"
+        f"# VERIFY — {task_id}\n\n"
+        "由 `task verify` 自动生成：实际执行了下列命令并全部通过。\n\n"
+        "## 命令与结果\n\n"
+        "| 步骤 | 命令 | 结果 |\n|------|------|------|\n" + rows + "\n"
+    )
+    os.makedirs(VERIFY_DIR, exist_ok=True)
+    out_path = os.path.join(VERIFY_DIR, verify_name + ".md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(body)
+    print(f"✓ 全部通过，已写 {os.path.relpath(out_path, AI_DIR)}")
+
+
+def cmd_done(args):
+    if "--force" in args:
+        die("--force 不能绕过任务关闭前置条件；请记录人工批准并满足证据要求")
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    set_status(path, "done", force=False)
+    cmd_index([])
+    print("提示: 更新 runtime/states/CURRENT_FOCUS.md 切换到下一个任务")
+
+
+def cmd_block(args):
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    reason = args[1] if len(args) > 1 else "（未填原因）"
+    set_status(path, "blocked")
+    append_blocker(args[0], reason)
+    print("提示: 更新 runtime/states/CURRENT_FOCUS.md")
+
+
+def cmd_unblock(args):
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    set_status(path, "in-progress")
+
+
+def cmd_review(args):
+    """提交审查：in-progress → in-review（实现完成，等待生成者之外的审查者）"""
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    set_status(path, "in-review")
+    touch_focus(args[0])
+    print("提示: 审查通过后 task approve TASK-xxx 关闭；需返工则 task start TASK-xxx（回 in-progress）")
+
+
+def cmd_approve(args):
+    """审查通过并关闭：in-review → done（强制要求 REVIEW 记录）"""
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    set_status(path, "done", require_review=True)
+    cmd_index([])
+    print("提示: 更新 runtime/states/CURRENT_FOCUS.md 切换到下一个任务")
+
+
+def cmd_cancel(args):
+    path = find_task(args[0])
+    if not path:
+        die(f"未找到任务: {args[0]}")
+    set_status(path, "cancelled")
+
+
+def touch_focus(task_id):
+    path = os.path.join(STATE_DIR, "CURRENT_FOCUS.md")
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"---\nname: CURRENT_FOCUS\nmetadata:\n  type: state\n  updated: {today()}\n---\n\n"
+                    f"# Current Focus — {today()}\n\n"
+                    f"## 当前任务\n{task_id} — in-progress\n\n"
+                    f"## 下一个动作\n1. 按 SDD_WORKFLOW.md 执行 {task_id}\n")
+        print(f"✓ 已创建 runtime/states/CURRENT_FOCUS.md")
+        return
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    text = re.sub(r"(updated:\s*)\d{4}-\d{2}-\d{2}", r"\g<1>" + today(), text, count=1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def append_blocker(task_id, reason):
+    path = os.path.join(STATE_DIR, "BLOCKERS.md")
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"---\nname: BLOCKERS\nmetadata:\n  type: state\n  updated: {today()}\n---\n\n# Blockers\n")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    num = len(re.findall(r"^### BLOCKER-\d+", text, re.M)) + 1
+    entry = f"\n### BLOCKER-{num:03d} — {reason[:60]}\n\n" \
+            f"| 项 | 内容 |\n|----|------|\n" \
+            f"| 阻塞任务 | {task_id} |\n" \
+            f"| 记录日期 | {today()} |\n" \
+            f"| 状态 | open |\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.rstrip() + "\n" + entry)
+    print(f"✓ 已追加 BLOCKER-{num:03d} 到 runtime/states/BLOCKERS.md")
+
+
+# ---------------- 校验 / 索引 ----------------
+
+def cmd_validate(args):
+    files = task_files()
+    if not files:
+        print("✓ runtime/tasks/ 为空，无需校验")
+        return
+    errors, seen = 0, set()
+    for f in files:
+        path = os.path.join(TASKS_DIR, f)
+        text, fm = load_task(path)
+        name = f[:-3]
+        if fm is None:
+            print(f"✗ {name}: frontmatter 缺失或损坏"); errors += 1; continue
+        if fm.get("name") != name:
+            print(f"✗ {name}: name 与文件名不一致（{fm.get('name')}）"); errors += 1
+        for req in ["name", "description", "metadata.status", "metadata.created", "metadata.updated"]:
+            if not fm.get(req):
+                print(f"✗ {name}: 缺少必填字段 {req}"); errors += 1
+        st = fm.get("metadata.status")
+        if st not in STATUSES:
+            print(f"✗ {name}: 非法状态 {st}"); errors += 1
+        if st == "done":
+            # 证据日期按任务完成当天（metadata.updated，状态机写入）判定，而非 validate 运行日
+            ref_date = fm.get("metadata.updated") or today()
+            if not verify_exists(name, ref_date):
+                print(f"✗ {name}: done 任务缺少任务完成当天（{ref_date}）通过的 VERIFY 记录"); errors += 1
+            risk = (fm.get("metadata.risk") or "P2").upper()
+            priority = (fm.get("metadata.priority") or "P2").upper()
+            reviewer = (fm.get("metadata.reviewer") or "any").strip()
+            if risk == "P0" and (fm.get("metadata.approval-ref") or "none").strip().lower() in ("", "none", "n/a"):
+                print(f"✗ {name}: P0 任务缺少 approval-ref"); errors += 1
+            if risk in ("P0", "P1") or priority in ("P0", "P1") or reviewer not in ("", "any", "none"):
+                if not review_exists(name, fm, ref_date):
+                    print(f"✗ {name}: 缺少独立且通过的 REVIEW 记录"); errors += 1
+            unchecked = [l for l in text.splitlines() if re.match(r"^\s*- \[ \]", l)]
+            if unchecked:
+                print(f"✗ {name}: done 任务仍有 {len(unchecked)} 条验收标准未勾选"); errors += 1
+        if st == "in-review" and not review_exists(name):
+            print(f"⚠ {name}: in-review 但暂无 REVIEW 记录（审查中属正常；approve 前必须写入）")
+        num = TASK_RE.match(f)
+        if num and num.group(1) in seen:
+            print(f"✗ {name}: 编号重复"); errors += 1
+        if num:
+            seen.add(num.group(1))
+    nums = sorted(int(TASK_RE.match(f).group(1)) for f in files if TASK_RE.match(f))
+    if nums and nums != list(range(min(nums), max(nums) + 1)):
+        missing = [n for n in range(min(nums), max(nums) + 1) if n not in nums]
+        print(f"⚠ 编号不连续，缺失: {[f'TASK-{n:03d}' for n in missing]}")
+    print("✓ 校验完成，0 错误" if errors == 0 else f"✗ 校验失败，{errors} 个错误")
+    sys.exit(1 if errors else 0)
+
+
+def cmd_index(args):
+    files = task_files()
+    if not os.path.isdir(TASKS_DIR):
+        os.makedirs(TASKS_DIR)
+    if not os.path.isdir(STATE_DIR):
+        os.makedirs(STATE_DIR)
+    rows = []
+    for f in files:
+        _, fm = load_task(os.path.join(TASKS_DIR, f))
+        if fm is None:
+            continue
+        rows.append((f[:-3], fm.get("metadata.status", "?"),
+                     fm.get("description", ""), fm.get("metadata.assignee", "any")))
+    # INDEX.md
+    idx = ["# INDEX — 任务索引（自动生成，勿手动编辑）", "", "| 任务 | 状态 | 描述 | assignee |", "|------|------|------|----------|"]
+    for r in sorted(rows):
+        desc = str(r[2]).split("\n")[0][:50]
+        idx.append(f"| {r[0]} | {r[1]} | {desc} | {r[3]} |")
+    with open(os.path.join(TASKS_DIR, "INDEX.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(idx) + "\n")
+    # PROGRESS.md
+    from collections import Counter
+    cnt = Counter(r[1] for r in rows)
+    prog = ["# Progress — 项目进度（自动生成，勿手动编辑）", "", "## 统计", "", "| 状态 | 数量 |", "|------|------|"]
+    for s in STATUSES:
+        prog.append(f"| {s} | {cnt.get(s, 0)} |")
+    prog += ["", "## 进行中", "", "| 任务 | 状态 | 描述 | assignee |", "|------|------|------|----------|"]
+    for r in sorted(r for r in rows if r[1] in ("in-progress", "in-review")):
+        prog.append(f"| {r[0]} | {r[1]} | {str(r[2])[:50]} | {r[3]} |")
+    prog += ["", "## 已完成（最近 10 条）", "", "| 任务 | 描述 |", "|------|------|"]
+    done = sorted((r for r in rows if r[1] == "done"), reverse=True)[:10]
+    for r in done:
+        prog.append(f"| {r[0]} | {str(r[2])[:50]} |")
+    with open(os.path.join(STATE_DIR, "PROGRESS.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(prog) + "\n")
+    print(f"✓ 已生成 runtime/tasks/INDEX.md 与 runtime/states/PROGRESS.md（{len(rows)} 个任务）")
+
+
+def cmd_stats(args):
+    from collections import Counter
+    cnt = Counter()
+    for f in task_files():
+        _, fm = load_task(os.path.join(TASKS_DIR, f))
+        cnt[fm.get("metadata.status", "?") if fm else "?"] += 1
+    for s in STATUSES + ["?"]:
+        print(f"{s:<12} {cnt.get(s, 0)}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(USAGE)
+        return
+    cmd, rest = args[0], args[1:]
+    cmds = {
+        "new": cmd_new, "list": cmd_list, "show": cmd_show,
+        "start": cmd_start, "verify": cmd_verify, "review": cmd_review, "approve": cmd_approve,
+        "done": cmd_done, "block": cmd_block,
+        "unblock": cmd_unblock, "cancel": cmd_cancel,
+        "validate": cmd_validate, "index": cmd_index, "stats": cmd_stats,
+    }
+    fn = cmds.get(cmd)
+    if not fn:
+        die(f"未知命令: {cmd}\n运行 task help 查看用法")
+    fn(rest)
+
+
+if __name__ == "__main__":
+    main()

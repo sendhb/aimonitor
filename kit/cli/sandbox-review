@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# ============================================================
+# sandbox-review — 审查专用沙箱（方案 D，配合 autoloop-* 无人值守审查）
+#
+# 与 cli/sandbox-run（严格无网络）的区别：
+#   - --network bridge：claude 需要联网调用 Anthropic API
+#   - 挂载 ~/.claude 凭据：容器内 claude 认证（.credentials.json）
+#   - 使用 aios-sandbox-review 镜像（预装 Claude Code CLI）
+#
+# ⚠️ 安全权衡（详细见 ADR-001 §sandbox-review 与 kit/tools/sandbox/README.md）：
+#   - Rule of Two：审查【可信项目代码】时 = ②持有凭据 + ③写文件/执行，无①不可信
+#     输入，不违反。✔ 可用于审查本项目/受信项目代码。
+#   - ❌ 禁止用它审查【不可信外部输入】（外部下载的代码/内容/网页），那构成
+#     ①+②，必须回退 cli/sandbox-run（无网络）或人工审查。
+#   - 其余隔离保留：--read-only 根 FS、只挂载项目目录、容器 --rm 一次性。
+#
+# 用法:
+#   cli/sandbox-review -- <command...>
+#   cli/sandbox-review -- bash cli/autoloop-reviewer --once --unattended
+# ============================================================
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 兼容两种布局（平铺 cli/ 与 kit 子目录 kit/cli/）：向上找含 aios.config.yaml 的项目根
+while [ ! -f "$ROOT/aios.config.yaml" ] && [ "$ROOT" != "/" ]; do
+  ROOT="$(dirname "$ROOT")"
+done
+if [ "${1:-}" = "--" ]; then
+  shift
+fi
+if [ $# -eq 0 ]; then
+  echo "用法: cli/sandbox-review -- <command...>" >&2
+  exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  echo "✗ 需要 docker" >&2
+  exit 1
+fi
+
+IMAGE="aios-sandbox-review"
+if ! docker build -q -f "$ROOT/kit/tools/sandbox/Dockerfile.review" -t "$IMAGE" "$ROOT/kit/tools/sandbox" >/dev/null; then
+  echo "✗ 构建 $IMAGE 失败" >&2
+  exit 1
+fi
+
+# 非 root 运行（UID/GID 对齐宿主机）：claude 的 --dangerously-skip-permissions 拒绝 root；
+# 同时避免容器内 root 写坏宿主机 ~/.claude 文件（曾发生 settings.json 被 root 覆盖）。
+# 凭据保护（reviewer ISSUE-001）：~/.claude 目录可写（claude 需建 session-env 供 Bash 工具使用），
+# 但凭据文件 .credentials.json 与配置 .claude.json 单独 :ro 只读覆盖挂载，容器内无法改写/删除。
+# 早期尝试对整个 ~/.claude 加 :ro 会阻断 claude Bash 工具（session-env EROFS），故采用目录可写+
+# 敏感文件覆盖只读的折中方案（TASK-006/007 复审验证）。
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+
+MOUNTS=(
+  "-v" "$ROOT:/workspace"
+  "-v" "$HOME/.claude:$HOME/.claude"
+  "-v" "$HOME/.claude/.credentials.json:$HOME/.claude/.credentials.json:ro"
+  "-v" "$HOME/.claude.json:$HOME/.claude.json:ro"
+  "-v" "$HOME/.pi/agent/models.json:$HOME/.pi/agent/models.json:ro"  # pi/deepseek provider 配置/key
+  "-v" "$HOME/.pi/agent/settings.json:$HOME/.pi/agent/settings.json:ro"  # pi defaultProvider/model
+  "-v" "$HOME/.pi/agent/auth.json:$HOME/.pi/agent/auth.json:ro"  # pi auth（如需要）
+)
+
+set -o noglob  # 防路径通配符展开
+# shellcheck disable=SC2086
+/usr/bin/env docker run --rm -i \
+  --network bridge \
+  --read-only --tmpfs /tmp \
+  "${MOUNTS[@]}" \
+  --user "$HOST_UID:$HOST_GID" \
+  -e "HOME=$HOME" \
+  -w /workspace \
+  "$IMAGE" "$*"

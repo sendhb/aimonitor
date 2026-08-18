@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+publish — 跨机器版本化发布（baseline 模式）
+
+把当前项目冻结内容打包成版本化发布包 + manifest，推送到共享位置
+（本地路径 / 共享盘 / git 仓库 clone 目录）。
+
+用法:
+  cli/publish <target-dir> [--version <ver>] [--include <dir>...]
+  cli/publish ../shared-baseline --version auto
+  cli/publish ../shared-baseline --include docs knowledge
+
+参考:
+  ../baseline/ 的 prototype-planning/<sync_version_id>/ 模式
+  源 project = 事实源；target-dir = 冻结发布目录（只写不读）
+"""
+import argparse
+import datetime
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def default_version():
+    return "sync-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="版本化发布当前项目到共享位置")
+    ap.add_argument("target_dir", help="发布目标目录（共享盘/git clone 目录）")
+    ap.add_argument("--version", default="auto", help="版本号（默认自动生成）")
+    ap.add_argument("--include", nargs="+", default=["docs", "knowledge"],
+                    help="要发布的目录（默认 docs knowledge）")
+    ap.add_argument("--package-name", default="pkg",
+                    help="包类型名（如 planning / scene-data / process-specs）")
+    args = ap.parse_args()
+
+    ver = default_version() if args.version == "auto" else args.version
+
+    # 检查要发布的目录存在
+    srcs = []
+    for d in args.include:
+        src = os.path.join(ROOT, d)
+        if os.path.isdir(src):
+            srcs.append(src)
+        else:
+            print(f"⚠ 跳过不存在的目录: {d}")
+
+    if not srcs:
+        sys.exit("✗ 没有可发布的目录，请用 --include 指定")
+
+    # 目标：<target>/<package-name>/<version>/
+    pkg_dir = os.path.join(args.target_dir, args.package_name, ver)
+    os.makedirs(pkg_dir, exist_ok=True)
+
+    # 复制内容
+    manifest = {
+        "package_id": f"{args.package_name}-{ver}",
+        "published_date": datetime.datetime.now().strftime("%Y-%m-%d"),
+        "source_root": ROOT,
+        "version": ver,
+        "directories": {},
+        "files": [],
+    }
+    for src in srcs:
+        name = os.path.basename(src)
+        dst = os.path.join(pkg_dir, name)
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        manifest["directories"][name] = name + "/"
+
+    # 收集文件清单（相对路径，以源目录为锚点：docs/guide.md）
+    for src in srcs:
+        base = os.path.basename(src)
+        for root, _, files in os.walk(src):
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), src)
+                manifest["files"].append(f"{base}/{rel}")
+    manifest["files"].sort()
+
+    # 写 manifest
+    with open(os.path.join(pkg_dir, "MANIFEST.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    print(f"✓ 已发布: {pkg_dir}")
+    print(f"  版本: {ver}")
+    print(f"  目录: {', '.join(manifest['directories'].keys())}")
+    print(f"  文件: {len(manifest['files'])} 个")
+    print(f"  manifest: {os.path.join(pkg_dir, 'MANIFEST.json')}")
+
+
+if __name__ == "__main__":
+    main()

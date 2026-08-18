@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# 强制 commit message 带 TASK-xxx 引用（aios/governance/task-policy.md：
+# "所有开发项必须对应一个 TASK"）。真的无关任务（chore/typo）就显式写 [no-task]，
+# 留痕比静默放行更符合"可追溯"的原则。
+set -euo pipefail
+MSG_FILE="$1"
+
+if grep -qE 'TASK-[0-9]{3}' "$MSG_FILE"; then
+  exit 0
+fi
+if grep -qF '[no-task]' "$MSG_FILE"; then
+  exit 0
+fi
+
+echo "✗ commit message 里没有 TASK-xxx 引用（aios/governance/task-policy.md）。" >&2
+echo "  加一行 'Refs: TASK-001' 之类的引用；真的没有对应任务就显式写 [no-task]。" >&2
+exit 1

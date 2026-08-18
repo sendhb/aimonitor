@@ -1,0 +1,29 @@
+version: 1
+profile: unity
+source_dirs:
+  - src/
+generated_dirs:
+  - dist/
+commands:
+  build: <build-command>
+  lint: <lint-command>
+  test: <test-command>
+  check: <check-command>
+
+# ---- 启动命令（可选；工程有启动入口时取消注释并填真实命令）----
+# 约定：Unity 工程启动通常是打开编辑器（如 Unity 编辑器 / Play Mode），
+#       命令登记在此处后，AI 通过 aios.config.yaml 即可发现并调用
+#       （cli/lib/config.py 保留 commands 额外键，不限于 build/lint/test/check）。
+# commands:
+#   start: <启动命令，如打开编辑器或批处理启动命令>
+
+# ---- SDD 扩展字段（仅当任务命中 aios/execution/sdd-workflow.md 场景 A' 时需要，取消注释并按需修改）----
+# project:
+#   kind: game-client
+# spec:
+#   type: docs
+# docs:
+#   domains: docs/domains/         # 功能规格（能力域、规则、约束）
+#   flows: docs/flows/             # 交互流程（用户操作步骤）
+#   design: docs/design/           # 设计文档（UI/架构，如有）
+#   screenshots: docs/screenshots/ # 功能验证截图
