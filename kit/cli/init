@@ -1,22 +1,27 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # ============================================================
 # init — 将 AIOS + Reliable AI Engineering Framework 安装到目标项目
 #        （kit/ 子目录布局：框架内容进 <目标>/kit/，工具配置/入口在项目根）
 #
-# 用法:
-#   bash cli/init [目标项目根目录] [--profile <type>] [--non-interactive]
+# 跨平台：Python 3 实现。Windows 原生 PowerShell 也可执行：
+#   python3 kit\cli\init . --profile backend
 #
-#   交互式终端下默认会问 profile 类型 + source_dirs/generated_dirs/
-#   build/lint/test/check 命令，生成实例化好的 aios.config.yaml。
-#   --profile <type>       跳过"选 profile"这一步，直接用该类型
-#   --non-interactive      不问任何问题，把 profile 模板原样复制成
-#                           aios.config.yaml（占位符需要事后手填）；
-#                           非 TTY（CI/脚本）环境下自动等效于此
+# 用法:
+#   kit/cli/init [目标项目根目录] [--profile <type>] [--non-interactive]
+#                [--install-deps] [--install-yes]
+#
+#   --profile <type>     跳过"选 profile"这一步，直接用该类型
+#   --non-interactive    不问任何问题，把 profile 模板原样复制成
+#                        aios.config.yaml（占位符需要事后手填）；
+#                        非 TTY（CI/脚本）环境下自动等效于此
+#   --install-deps       检测 git/python3，缺失时按平台自动安装
+#                        （Linux: apt/dnf/yum/pacman；macOS: brew；Windows: winget/choco）
+#   --install-yes        配合 --install-deps，跳过确认直接执行
 #
 # 安装产物（与 cli/mkproject 生成的结构一致，可装进已存在的项目）:
 #   <目标>/kit/             框架（只读，升级时整体替换）
 #   <目标>/AGENTS.md        统一规则入口（25+ 工具原生读取，完整框架导航）
-#   <目标>/CLAUDE.md        → symlink AGENTS.md（Claude Code）
+#   <目标>/CLAUDE.md        → symlink AGENTS.md（Claude Code；Windows 需开发者模式/管理员）
 #   <目标>/.cursor/         Cursor 条件规则（*.mdc）
 #   <目标>/.claude/         Claude Code 路径条件规则 + 本地设置
 #   <目标>/.pi/SYSTEM.md    pi 系统提示词（治理规则注入）
@@ -25,195 +30,411 @@
 #   <目标>/aios.config.yaml 实例化好的项目配置（交互式向导生成）
 #   <目标>/knowledge/ docs/ runtime/（项目可写区 + runtime 模板）
 # ============================================================
-set -euo pipefail
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import platform
+from pathlib import Path
 
-KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# 工具配置/项目入口在源仓库根：kit 布局时 = kit/ 的父目录；平铺时 = 框架根自身
-if [ "$(basename "$KIT")" = "kit" ]; then
-  SRC_ROOT="$(dirname "$KIT")"
-else
-  SRC_ROOT="$KIT"
-fi
-TARGET="."
-PROFILE=""
-NONINTERACTIVE=0
+# Windows GBK 控制台下，✓/⚠ 等 Unicode 字符无法编码会直接抛 UnicodeEncodeError
+# 导致 init 在复制完成后才崩溃（TASK-011 同类）。统一重配为 UTF-8 + replace
+# （Linux UTF-8 locale 下 reconfigure 无副作用）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --profile) PROFILE="$2"; shift 2 ;;
-    --non-interactive) NONINTERACTIVE=1; shift ;;
-    -*) echo "未知参数: $1" >&2; exit 1 ;;
-    *) TARGET="$1"; shift ;;
-  esac
-done
+# ---------- 路径定位 ----------
+# resolve() 解析符号链接：与 main() 中 target 的 .resolve() 口径一致，
+# 避免 src_root（逻辑路径）与 target（物理路径）不一致导致 guard 被绕过（FIND-002）。
+SCRIPT = Path(__file__).resolve()
+CLI_DIR = SCRIPT.parent
+KIT = CLI_DIR.parent
+if KIT.name == "kit":
+    SRC_ROOT = KIT.parent
+else:
+    SRC_ROOT = KIT
 
-if [ ! -d "$TARGET" ]; then
-  mkdir -p "$TARGET"
-fi
-TARGET="$(cd "$TARGET" && pwd)"
-
-# ---------- 防呆：目标不能是框架源仓库自身或其子目录 ----------
-# 在源仓库里执行 init 会把框架复制进自己（嵌套 kit/kit、框架目录重复、
-# runtime/ 实例区被塞模板），且毫无意义——源仓库已是完整项目。
-case "$TARGET" in
-  "$SRC_ROOT"|"$SRC_ROOT"/*)
-    echo "✗ 目标 $TARGET 位于框架源仓库（$SRC_ROOT）内——不能在这里执行 init。" >&2
-    echo "  init 用于把框架安装到目标项目；源仓库激活 githooks 只需:" >&2
-    echo "    git config core.hooksPath .githooks" >&2
-    exit 1
-    ;;
-esac
-
-echo "═══ AIOS + Reliable AI Engineering Framework 安装 ═══"
-echo "kit     : $KIT"
-echo "target  : $TARGET"
-echo ""
-
-# ---------- 复制框架结构（已存在不覆盖，幂等）----------
-copy_dir() {
-  local src="$1" dst="$2"
-  if [ -d "$src" ]; then
-    mkdir -p "$dst"
-    cp -rn "$src"/* "$dst/" 2>/dev/null || true
-    echo "  ✓ $dst"
-  fi
+# 框架复制时排除的内容（copytree ignore 语义）
+KIT_COPY_EXCLUDES = {
+    "__pycache__", "*.pyc", ".git",
+    ".cursor", ".claude", ".pi", ".github", ".githooks",
+    "aios.config.yaml", "install.sh", "install.ps1", "cmd-steps.md",
 }
+# runtime/ 只复制模板/说明，绝不继承 kit 自己的任务实例数据
+RUNTIME_TEMPLATE_GLOBS = ("README.md", "*.template.md", "*_WORKFLOW.md")
 
-inst_file() {
-  local src="$1" dst="$2"
-  [ -f "$src" ] && cp -n "$src" "$dst" 2>/dev/null && echo "  ✓ $dst" || true
-}
-
-# runtime/ 混杂了"模板/说明"（README、*.template.md、*_WORKFLOW.md）和
-# "这个 kit 自己开发时产生的任务实例数据"（TASK-001、它的 REVIEW/VERIFY、
-# CURRENT_FOCUS.md、logs/*）。下游项目只该拿到前者，绝不该继承 kit 自己的
-# 任务历史——否则每个新项目里都会平白多出一个别人的 TASK-001。
-copy_runtime_templates() {
-  local src="$1" dst="$2"
-  mkdir -p "$dst"
-  find "$src" -type f \( -name "README.md" -o -name "*.template.md" -o -name "*_WORKFLOW.md" \) \
-    | while IFS= read -r f; do
-        rel="${f#"$src"/}"
-        mkdir -p "$dst/$(dirname "$rel")"
-        cp -n "$f" "$dst/$rel" 2>/dev/null || true
-      done
-  echo "  ✓ $dst（仅模板/说明文件，不含 kit 自己的任务实例数据）"
-}
-
-# ---------- 1. 框架内容 → <目标>/kit/（整目录复制，排除缓存/配置/工具配置） ----------
-mkdir -p "$TARGET/kit"
-find "$KIT" -mindepth 1 -maxdepth 1 \
-  ! -name '__pycache__' ! -name '*.pyc' ! -name '.git' \
-  ! -name '.cursor' ! -name '.claude' ! -name '.pi' ! -name '.github' ! -name '.githooks' \
-  ! -name 'aios.config.yaml' ! -name 'install.sh' ! -name 'install.ps1' ! -name 'cmd-steps.md' \
-  -exec cp -rn {} "$TARGET/kit/" \; 2>/dev/null || true
-# 清掉嵌套缓存（copytree ignore 语义：__pycache__/*.pyc 不进入目标）
-find "$TARGET/kit" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
-find "$TARGET/kit" -type f -name '*.pyc' -delete 2>/dev/null || true
-echo "  ✓ $TARGET/kit（框架内容，整目录复制，结构同 mkproject）"
-
-# ---------- 1c. 工具配置目录（.cursor/.claude/.pi/.github/.githooks）→ 项目根 ----------
-#     工具（Cursor/Claude Code/pi/GitHub Actions/git hooks）按项目根读取配置，
-#     因此必须放项目根，不能放 kit/ 内。整目录复制，与 mkproject 一致。
-copy_dir "$SRC_ROOT/.cursor"   "$TARGET/.cursor"
-copy_dir "$SRC_ROOT/.claude"   "$TARGET/.claude"
-copy_dir "$SRC_ROOT/.pi"       "$TARGET/.pi"
-copy_dir "$SRC_ROOT/.github"   "$TARGET/.github"
-copy_dir "$SRC_ROOT/.githooks" "$TARGET/.githooks"
-
-# ---------- 1d. 项目入口文件（AGENTS.md 完整导航 + opencode.md；CLAUDE.md symlink） ----------
-inst_file "$SRC_ROOT/AGENTS.md"   "$TARGET/AGENTS.md"
-inst_file "$SRC_ROOT/opencode.md" "$TARGET/opencode.md"
-# Claude Code: symlink CLAUDE.md → AGENTS.md（官方推荐）
-if [ ! -e "$TARGET/CLAUDE.md" ]; then
-  ln -s AGENTS.md "$TARGET/CLAUDE.md" && echo "  ✓ $TARGET/CLAUDE.md → AGENTS.md"
-fi
-
-# ---------- 2. runtime 模板 + 项目可写区 ----------
-copy_runtime_templates "$KIT/runtime" "$TARGET/runtime"
-for d in knowledge docs; do
-  mkdir -p "$TARGET/$d"
-done
-for d in runtime/tasks runtime/states runtime/executions runtime/reviews runtime/verification runtime/logs runtime/memory; do
-  mkdir -p "$TARGET/$d"
-done
-
-# ---------- 3. aios.config.yaml 实例化 ----------
-CONFIG_DST="$TARGET/aios.config.yaml"
-if [ -f "$CONFIG_DST" ]; then
-  echo "  · aios.config.yaml 已存在，不覆盖"
-else
-  AVAILABLE_PROFILES="$(find "$KIT/profiles" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
-
-  if [ -z "$PROFILE" ] && [ "$NONINTERACTIVE" = "0" ] && [ -t 0 ]; then
-    echo ""
-    echo "选择项目类型 profile："
-    select p in $AVAILABLE_PROFILES; do
-      if [ -n "$p" ]; then PROFILE="$p"; break; fi
-      echo "无效选择，重新来"
-    done
-  fi
-
-  if [ -z "$PROFILE" ]; then
-    echo "  · 未指定 profile，跳过 aios.config.yaml 生成"
-    echo "    可选: $(echo "$AVAILABLE_PROFILES" | tr '\n' ' ')"
-    echo "    后续手动复制 kit/profiles/<type>/config.template.yaml 为 aios.config.yaml 并填好"
-  else
-    TEMPLATE_SRC="$KIT/profiles/$PROFILE/config.template.yaml"
-    if [ ! -f "$TEMPLATE_SRC" ]; then
-      echo "  ✗ 未知 profile: $PROFILE（可选: $(echo "$AVAILABLE_PROFILES" | tr '\n' ' ')）" >&2
-      exit 1
-    fi
-    if [ "$NONINTERACTIVE" = "1" ] || [ ! -t 0 ]; then
-      cp "$TEMPLATE_SRC" "$CONFIG_DST"
-      echo "  ✓ $CONFIG_DST（$PROFILE 模板原样复制，占位符 <...> 需要手动填）"
-    else
-      python3 "$KIT/cli/lib/init_wizard.py" "$TEMPLATE_SRC" "$CONFIG_DST" "$PROFILE"
-    fi
-  fi
-fi
-
-# ---------- 4. 锁 generated_dirs 只读 + githooks ----------
-if [ -f "$CONFIG_DST" ]; then
-  (cd "$TARGET" && bash kit/cli/protect 2>/dev/null) || true
-fi
-
-chmod +x "$TARGET"/.githooks/* 2>/dev/null || true
-if [ -d "$TARGET/.git" ]; then
-  (cd "$TARGET" && git config core.hooksPath .githooks)
-  echo "  ✓ git config core.hooksPath .githooks（pre-commit/commit-msg 已生效）"
-else
-  echo "  · $TARGET 还不是 git 仓库：git init 之后手动跑一次"
-  echo "    git config core.hooksPath .githooks"
-fi
-
-# ---------- 5. 简易 .gitignore（仅当项目还没有时生成，与 mkproject 结构一致） ----------
-if [ ! -f "$TARGET/.gitignore" ]; then
-  cat > "$TARGET/.gitignore" <<'EOF'
-runtime/tasks/*
+GITIGNORE = """runtime/tasks/*
 runtime/logs/*
 runtime/verification/*
 runtime/reviews/*
 runtime/memory/*
 .env
 __pycache__/
-EOF
-  echo "  ✓ .gitignore（新建，已存在则保留项目自己的）"
-fi
+"""
 
-echo ""
-echo "═══ 安装完成 ═══"
-echo "入口文件:"
-echo "  kit/          — 框架（只读，升级时整体替换）"
-echo "  AGENTS.md     — 统一入口（pi/OpenCode/Qwen Code/Cursor/Copilot 原生读取）"
-echo "  CLAUDE.md     — symlink → AGENTS.md（Claude Code）"
-echo "  .pi/SYSTEM.md — pi 系统提示词（治理规则注入）"
-echo ""
-echo "下一步:"
-if [ -f "$CONFIG_DST" ]; then
-  echo "  1. 检查/补全 aios.config.yaml（尤其留空的 commands.*）"
-else
-  echo "  1. 复制 kit/profiles/<type>/config.template.yaml 为项目根目录 aios.config.yaml 并填好（刚才跳过了实例化）"
-fi
-echo "  2. bash kit/cli/task new \"第一个任务\""
-echo "  3. AI agent 读 AGENTS.md 进入工作流；跑 kit/cli/task verify TASK-xxx 生成真实 VERIFY 记录（不是手写）"
+# 非 TTY（管道/CI）下 Python stdout 是全缓冲，会导致子进程（protect）的
+# stderr 先于本脚本的 stdout 显示、顺序错乱。改为行缓冲保证输出顺序正确。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
+
+def log(msg):
+    print(f"  {msg}")
+
+
+def step(msg):
+    print(msg)
+
+
+# ---------- 依赖自举（--install-deps） ----------
+def missing_tools():
+    """返回缺失工具名的列表（git / python）。"""
+    missing = []
+    if shutil.which("git") is None:
+        missing.append("git")
+    if shutil.which("python3") is None and shutil.which("python") is None:
+        missing.append("python")
+    return missing
+
+
+def install_commands(system):
+    """按平台返回 [(包管理器名, 安装命令列表), ...]，按优先级排列。"""
+    if system == "Linux":
+        return [
+            ("apt-get", ["sudo", "apt-get", "install", "-y", "git", "python3"]),
+            ("dnf", ["sudo", "dnf", "install", "-y", "git", "python3"]),
+            ("yum", ["sudo", "yum", "install", "-y", "git", "python3"]),
+            ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "git", "python3"]),
+        ]
+    if system == "Darwin":
+        return [("brew", ["brew", "install", "git", "python3"])]
+    if system == "Windows":
+        return [
+            ("winget", ["winget", "install", "--id", "Git.Git",
+                        "--accept-source-agreements", "--accept-package-agreements"]),
+            ("winget", ["winget", "install", "--id", "Python.Python.3.12",
+                        "--accept-source-agreements", "--accept-package-agreements"]),
+            ("choco", ["choco", "install", "git", "-y"]),
+            ("choco", ["choco", "install", "python", "-y"]),
+        ]
+    return []
+
+
+def bootstrap_deps(install_yes=False):
+    """--install-deps 自举：检测并安装缺失依赖。返回 True=全部就绪。"""
+    missing = missing_tools()
+    if not missing:
+        print("  ✓ 依赖就绪（git/python3 已安装）")
+        return True
+    system = platform.system()
+    candidates = install_commands(system)
+    if not candidates:
+        print(f"  ✗ 缺少: {', '.join(missing)}；平台 {system} 暂无自动安装方案，请手动安装后重试。")
+        return False
+    print(f"  · 缺少: {', '.join(missing)}，尝试按平台自动安装（{system}）")
+    for pkg_mgr, cmd in candidates:
+        if shutil.which(pkg_mgr) is None:
+            continue
+        print(f"  → 使用 {pkg_mgr}: {' '.join(cmd)}")
+        if not install_yes and sys.stdin.isatty():
+            try:
+                ans = input("    确认执行? [y/N] ").strip().lower()
+            except EOFError:
+                ans = "n"
+            if ans not in ("y", "yes"):
+                print("  · 已取消自动安装，请手动安装后重试。")
+                return False
+        try:
+            subprocess.run(cmd, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"  ✗ {pkg_mgr} 安装失败: {e}；尝试下一个包管理器")
+            continue
+        if not missing_tools():
+            print("  ✓ 依赖已安装")
+            return True
+    print("  ✗ 自动安装未成功，请手动安装缺失依赖后重试。")
+    return False
+
+
+# ---------- 复制逻辑 ----------
+def _copy_tree_no_clobber(src, dst, ignore=None):
+    """递归复制 src → dst，已存在的文件不覆盖（等价 bash cp -rn，FIND-001 修复）。"""
+    src, dst = Path(src), Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if ignore is not None and item.name in ignore(src, [item.name]):
+            continue
+        target = dst / item.name
+        if item.is_dir():
+            _copy_tree_no_clobber(item, target, ignore=ignore)
+        elif not target.exists():
+            shutil.copy2(item, target)
+
+
+def copy_dir(src, dst):
+    """整目录复制（已存在不覆盖，幂等，等价 bash cp -rn）。"""
+    src, dst = Path(src), Path(dst)
+    if not src.is_dir():
+        return
+    _copy_tree_no_clobber(src, dst, ignore=shutil.ignore_patterns(*KIT_COPY_EXCLUDES))
+    log(f"✓ {dst}")
+
+
+def inst_file(src, dst):
+    src, dst = Path(src), Path(dst)
+    if not src.is_file():
+        return
+    if not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        log(f"✓ {dst}")
+
+
+def copy_kit(target):
+    """框架内容 → <目标>/kit/（整目录复制，已存在不覆盖，排除缓存/配置/工具配置）。"""
+    kit_dst = target / "kit"
+    kit_dst.mkdir(parents=True, exist_ok=True)
+    for item in KIT.iterdir():
+        if item.name in KIT_COPY_EXCLUDES or item.name.startswith("__pycache__"):
+            continue
+        if item.suffix == ".pyc":
+            continue
+        dst = kit_dst / item.name
+        if item.is_dir():
+            _copy_tree_no_clobber(item, dst,
+                                  ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            if not dst.exists():
+                shutil.copy2(item, dst)
+    # 清掉嵌套缓存（copytree ignore 语义：__pycache__/*.pyc 不进入目标）
+    for cache in kit_dst.rglob("__pycache__"):
+        shutil.rmtree(cache, ignore_errors=True)
+    for pyc in kit_dst.rglob("*.pyc"):
+        pyc.unlink(missing_ok=True)
+    log(f"✓ {kit_dst}（框架内容，整目录复制，结构同 mkproject）")
+
+
+def copy_runtime_templates(target):
+    """runtime/ 模板（README.md / *.template.md / *_WORKFLOW.md）→ 目标 runtime/。"""
+    src = KIT / "runtime"
+    dst = target / "runtime"
+    dst.mkdir(parents=True, exist_ok=True)
+    if not src.is_dir():
+        log(f"✓ {dst}（runtime 模板目录不存在，已建空目录）")
+        return
+    for pat in RUNTIME_TEMPLATE_GLOBS:
+        for f in src.rglob(pat):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(src)
+            out = dst / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if not out.exists():
+                shutil.copy2(f, out)
+    log(f"✓ {dst}（仅模板/说明文件，不含 kit 自己的任务实例数据）")
+
+
+def available_profiles():
+    profiles_dir = KIT / "profiles"
+    if not profiles_dir.is_dir():
+        return []
+    return sorted(p.name for p in profiles_dir.iterdir() if p.is_dir())
+
+
+def make_symlink(target):
+    """CLAUDE.md → AGENTS.md（Claude Code 官方推荐）。Windows 需开发者模式/管理员。"""
+    link = target / "CLAUDE.md"
+    if link.exists() or link.is_symlink():
+        return
+    try:
+        os.symlink("AGENTS.md", link)
+        log(f"✓ {link} → AGENTS.md")
+    except OSError as e:
+        print(f"  · 无法创建 CLAUDE.md symlink（Windows 需开发者模式/管理员权限）: {e}")
+        print(f"    可手动创建: 将 {target / 'AGENTS.md'} 复制为 {link}")
+
+
+def setup_config(target, profile, non_interactive):
+    """aios.config.yaml 实例化。返回是否生成了 config。"""
+    config_dst = target / "aios.config.yaml"
+    if config_dst.exists():
+        print("  · aios.config.yaml 已存在，不覆盖")
+        return True
+
+    profiles = available_profiles()
+    interactive = (not non_interactive) and sys.stdin.isatty()
+
+    if not profile and interactive:
+        print("选择项目类型 profile：")
+        for i, p in enumerate(profiles, 1):
+            print(f"  {i}) {p}")
+        while True:
+            try:
+                choice = input("> ").strip()
+            except EOFError:
+                choice = ""
+            if choice.isdigit() and 1 <= int(choice) <= len(profiles):
+                profile = profiles[int(choice) - 1]
+                break
+            if choice in profiles:
+                break
+            print("  无效选择，重新来")
+
+    if not profile:
+        print("  · 未指定 profile，跳过 aios.config.yaml 生成")
+        if profiles:
+            print(f"    可选: {' '.join(profiles)}")
+        print("    后续手动复制 kit/profiles/<type>/config.template.yaml 为 aios.config.yaml 并填好")
+        return False
+
+    template_src = KIT / "profiles" / profile / "config.template.yaml"
+    if not template_src.is_file():
+        print(f"  ✗ 未知 profile: {profile}（可选: {' '.join(profiles)}）")
+        sys.exit(1)
+
+    if non_interactive or not sys.stdin.isatty():
+        shutil.copy2(template_src, config_dst)
+        print(f"  ✓ {config_dst}（{profile} 模板原样复制，占位符 <...> 需要手动填）")
+        return True
+
+    # 交互式 wizard
+    wizard = CLI_DIR / "lib" / "init_wizard.py"
+    subprocess.run([sys.executable, str(wizard), str(template_src), str(config_dst), profile], check=True)
+    return True
+
+
+def setup_githooks(target, config_present):
+    """锁 generated_dirs 只读 + githooks 生效。"""
+    if config_present:
+        protect = CLI_DIR / "protect"
+        try:
+            subprocess.run([str(protect)], cwd=str(target), check=False)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"  · protect 未能执行（{e}），跳过只读锁定")
+    # chmod githooks 可执行（Windows 上无实际效果，容忍失败）
+    hooks_dir = target / ".githooks"
+    if hooks_dir.is_dir():
+        for f in hooks_dir.iterdir():
+            if f.is_file():
+                try:
+                    os.chmod(f, 0o755)
+                except OSError:
+                    pass
+    git_dir = target / ".git"
+    if git_dir.is_dir():
+        try:
+            subprocess.run(["git", "config", "core.hooksPath", ".githooks"],
+                           cwd=str(target), check=True)
+            print("  ✓ git config core.hooksPath .githooks（pre-commit/commit-msg 已生效）")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"  · git config 失败: {e}")
+    else:
+        print("  · 目标还不是 git 仓库：git init 之后手动跑一次")
+        print("    git config core.hooksPath .githooks")
+
+
+def guard_target(src_root, target):
+    """防呆：目标不能在框架源仓库内（嵌套 kit/kit 自复制）。"""
+    try:
+        target.relative_to(src_root)
+    except ValueError:
+        return
+    print(f"✗ 目标 {target} 位于框架源仓库（{src_root}）内——不能在这里执行 init。")
+    print("  init 用于把框架安装到目标项目；源仓库激活 githooks 只需:")
+    print("    git config core.hooksPath .githooks")
+    sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="init",
+        description="将 AIOS + Reliable AI Engineering Framework 安装到目标项目（跨平台 Python 版）",
+    )
+    parser.add_argument("target", nargs="?", default=".",
+                        help="目标项目根目录（默认当前目录）")
+    parser.add_argument("--profile", default="", help="项目类型 profile（backend/frontend/unity/...）")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="非交互模式：profile 模板原样复制，占位符事后手填")
+    parser.add_argument("--install-deps", action="store_true",
+                        help="检测 git/python3，缺失时按平台自动安装")
+    parser.add_argument("--install-yes", action="store_true",
+                        help="配合 --install-deps：跳过确认直接执行安装命令")
+    args = parser.parse_args()
+
+    # ---------- 依赖自举（可选） ----------
+    if args.install_deps:
+        if not bootstrap_deps(install_yes=args.install_yes):
+            sys.exit(1)
+
+    # ---------- 定位目标 ----------
+    target = Path(args.target).expanduser().resolve()
+
+    # ---------- 防呆：目标不能是框架源仓库自身或其子目录 ----------
+    # 在源仓库里执行 init 会把框架复制进自己（嵌套 kit/kit、框架目录重复、
+    # runtime/ 实例区被塞模板），且毫无意义——源仓库已是完整项目。
+    guard_target(SRC_ROOT, target)
+    target.mkdir(parents=True, exist_ok=True)
+
+    print("═══ AIOS + Reliable AI Engineering Framework 安装 ═══")
+    print(f"kit     : {KIT}")
+    print(f"target  : {target}")
+    print()
+
+    # ---------- 1. 框架内容 → <目标>/kit/ ----------
+    copy_kit(target)
+
+    # ---------- 1c. 工具配置目录（.cursor/.claude/.pi/.github/.githooks）→ 项目根 ----------
+    for d in (".cursor", ".claude", ".pi", ".github", ".githooks"):
+        copy_dir(SRC_ROOT / d, target / d)
+
+    # ---------- 1d. 项目入口文件（AGENTS.md + opencode.md + .gitattributes；CLAUDE.md symlink） ----------
+    inst_file(SRC_ROOT / "AGENTS.md", target / "AGENTS.md")
+    inst_file(SRC_ROOT / "opencode.md", target / "opencode.md")
+    inst_file(SRC_ROOT / ".gitattributes", target / ".gitattributes")  # TASK-009：新项目继承行尾规则
+    make_symlink(target)
+
+    # ---------- 2. runtime 模板 + 项目可写区 ----------
+    copy_runtime_templates(target)
+    for d in ("knowledge", "docs"):
+        (target / d).mkdir(parents=True, exist_ok=True)
+    for d in ("runtime/tasks", "runtime/states", "runtime/executions",
+              "runtime/reviews", "runtime/verification", "runtime/logs", "runtime/memory"):
+        (target / d).mkdir(parents=True, exist_ok=True)
+
+    # ---------- 3. aios.config.yaml 实例化 ----------
+    config_present = setup_config(target, args.profile, args.non_interactive)
+
+    # ---------- 4. 锁 generated_dirs 只读 + githooks ----------
+    setup_githooks(target, config_present)
+
+    # ---------- 5. 简易 .gitignore（仅当项目还没有时生成，与 mkproject 结构一致） ----------
+    gitignore = target / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(GITIGNORE, encoding="utf-8")
+        log("✓ .gitignore（新建，已存在则保留项目自己的）")
+
+    print()
+    print("═══ 安装完成 ═══")
+    print("入口文件:")
+    print("  kit/          — 框架（只读，升级时整体替换）")
+    print("  AGENTS.md     — 统一入口（pi/OpenCode/Qwen Code/Cursor/Copilot 原生读取）")
+    print("  CLAUDE.md     — symlink → AGENTS.md（Claude Code）")
+    print("  .pi/SYSTEM.md — pi 系统提示词（治理规则注入）")
+    print()
+    print("下一步:")
+    if config_present:
+        print("  1. 检查/补全 aios.config.yaml（尤其留空的 commands.*）")
+    else:
+        print("  1. 复制 kit/profiles/<type>/config.template.yaml 为项目根目录 aios.config.yaml 并填好（刚才跳过了实例化）")
+    print("  2. kit/cli/task new \"第一个任务\"")
+    print("  3. AI agent 读 AGENTS.md 进入工作流；跑 kit/cli/task verify TASK-xxx 生成真实 VERIFY 记录（不是手写）")
+
+
+if __name__ == "__main__":
+    main()

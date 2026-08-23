@@ -49,6 +49,9 @@ __pycache__/
 config/agents.json
 config/agents.example.json
 
+# 管理员密码（TASK-049：自动生成，gitignored）
+config/admin.json
+
 # 生成目录（generated_dirs，只由生成器写入）
 dist/
 

@@ -42,6 +42,13 @@ import datetime
 import shutil
 import subprocess
 
+# Windows 控制台 GBK 下 print(✓/✗/中文) 会 UnicodeEncodeError（TASK-002）；
+# 子进程输出统一按 UTF-8 解码（errors=replace 防个别非法字节打断读取线程）。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def find_project_root(start):
     """从脚本位置向上寻找项目根（含 aios.config.yaml 的目录）。
@@ -81,6 +88,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib
 import config as cfg_lib  # noqa: E402
 
 STATUSES = ["open", "in-progress", "in-review", "blocked", "done", "cancelled"]
+REWORK_LIMIT = 2  # 自动返工上限：rework-count 0→1→2 允许，2→3 拒绝（TASK-047）
 TRANSITIONS = {
     "open": ["in-progress", "blocked", "cancelled"],
     "in-progress": ["in-review", "done", "blocked", "cancelled"],
@@ -355,10 +363,42 @@ def cmd_show(args):
     print(open(path, encoding="utf-8").read())
 
 
+def bump_rework(path, task_id):
+    """in-review → in-progress（打回）时递增 metadata.rework-count；超限拒绝。
+
+    首次开始（open → in-progress）不计数。返回新值；未打回时返回 None。
+    """
+    _, fm = load_task(path)
+    if (fm or {}).get("metadata.status") != "in-review":
+        return None
+    rework = 0
+    raw = (fm.get("metadata.rework-count") or "0").strip()
+    try:
+        rework = int(raw)
+    except ValueError:
+        rework = 0
+    new_rework = rework + 1
+    if new_rework > REWORK_LIMIT:
+        die(f"{task_id}: 返工已达上限（{REWORK_LIMIT} 次，第 {new_rework} 次打回被拒绝）。"
+            f"请人工介入：拆分任务，或记录介入原因后调整 metadata.rework-count 继续。")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    if re.search(r"^\s*rework-count:\s*", text, re.M):
+        text = re.sub(r"^(\s*rework-count:\s*).*$", r"\g<1>" + str(new_rework), text, count=1, flags=re.M)
+    else:
+        # 旧任务无该字段：在 depends-on 后插入
+        text = re.sub(r"^(\s*depends-on:.*)$", r"\1\n  rework-count: " + str(new_rework), text, count=1, flags=re.M)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"✓ 打回计数 rework-count: {rework} → {new_rework}")
+    return new_rework
+
+
 def cmd_start(args):
     path = find_task(args[0])
     if not path:
         die(f"未找到任务: {args[0]}")
+    bump_rework(path, args[0])
     set_status(path, "in-progress")
     touch_focus(args[0])
 
@@ -366,7 +406,8 @@ def cmd_start(args):
 def _git_commit():
     try:
         proc = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                               cwd=AI_DIR, capture_output=True, text=True)
+                               cwd=AI_DIR, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
         out = proc.stdout.strip()
         return out if proc.returncode == 0 and out else "n/a"
     except FileNotFoundError:
@@ -394,7 +435,8 @@ def cmd_verify(args):
         cmd = cfg["commands"][step]
         print(f"▶ {step}: {cmd}")
         transcript.append(f"$ {cmd}   # {step}")
-        proc = subprocess.run(cmd, shell=True, cwd=AI_DIR, capture_output=True, text=True)
+        proc = subprocess.run(cmd, shell=True, cwd=AI_DIR, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
         transcript.append(proc.stdout)
         transcript.append(proc.stderr)
         if proc.returncode != 0:

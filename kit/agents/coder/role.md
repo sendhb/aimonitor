@@ -22,6 +22,13 @@
 - VERIFY 记录（`cli/task verify TASK-xxx` 自动生成，不要手写 `runtime/verification/VERIFY-xxx.md`）
 - TASK 进度更新
 
+## 分级（fast-path）
+
+- **fast-path**（risk/priority 均非 P0/P1 且未指定 reviewer）：verify 通过后直接 `task done`，不提交 review。
+- **完整路径**（P0/P1 或指定 reviewer）：verify 通过后 `task review`。
+- `metadata.rework-count ≥ 3` 的任务不自动实现，转 block 等人工介入。
+- 判定与流程见 `aios/governance/task-policy.md`。
+
 ## 约束
 - **Plan First**：没有 approved plan 不写代码
 - **Verify 强制**：不通过 `config.commands.check` 不提交

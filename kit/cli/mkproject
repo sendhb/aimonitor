@@ -10,6 +10,12 @@ mkproject — 用 kit/ 子目录布局创建新项目
   cli/mkproject <project-dir> [--profile backend|design|...] [--from <kit-root>]
   cli/mkproject ~/code/my-project --profile design
 
+人格（可选）:
+  --persona <name>   人格名：从人格库（源 kit/personas/ 或源 personas/）选一个激活，
+                     写入新项目 personas/active.md（按需加载，工具只读该文件）
+  --no-persona       生成无个人格项目：不激活任何人格（零加载，默认继承源激活状态）
+  （人格模板参考: kit/templates/persona.template.md；切换: kit/cli/persona）
+
 生成的结构:
   <project>/
   ├── kit/                  # 框架（只读，升级时整体替换）
@@ -28,10 +34,119 @@ import shutil
 import sys
 import subprocess
 
+# Windows 中文控制台（GBK）对非 GBK 字符（如 ✓/⚠）输出会抛 UnicodeEncodeError；
+# 与 kit/cli/task 对齐：stdout/stderr 强制 UTF-8，errors=replace 兜底。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # 本文件位于 <kit>/cli/mkproject，kit 源仓库根 = 向上两级
 # aibase 自身也是 kit/ 子目录布局，框架内容在 <kit_root>/kit/，与项目保持一致
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES = ["backend", "game-server", "unity", "unreal", "frontend", "data", "novel", "design"]
+
+def persona_lib_dirs(kit_root):
+    """返回可能的人格库目录列表（框架库 + 源项目库）。"""
+    return [os.path.join(kit_root, "personas"), os.path.join(os.path.dirname(kit_root), "personas")]
+
+
+def apply_persona(project, persona_name=None, no_persona=False, kit_root=None):
+    """在新项目 personas/ 写入 active.md（按需加载，工具只读该文件）。
+
+    优先级: --persona <name> 从人格库选 → 默认继承源 active.md → 零加载。
+    返回改动描述字符串。
+    """
+    proj_personas = os.path.join(project, "personas")
+    os.makedirs(proj_personas, exist_ok=True)
+    active = os.path.join(proj_personas, "active.md")
+
+    if no_persona:
+        if os.path.exists(active) or os.path.islink(active):
+            os.remove(active)
+        return "已跳过人格（--no-persona，零加载）"
+
+    if persona_name:
+        # 从人格库选（源 kit/personas/ 优先，其次源项目 personas/）
+        src = None
+        for lib in persona_lib_dirs(kit_root or ""):
+            p = os.path.join(lib, f"{persona_name}.md")
+            if os.path.isfile(p):
+                src = p
+                break
+        if src is None:
+            sys.exit(f"✗ 人格不存在: {persona_name}（可用: kit/cli/persona list）")
+        with open(src, encoding="utf-8") as f:
+            body = f.read().strip()
+        if not body:
+            sys.exit(f"✗ 人格文件为空: {src}")
+        with open(active, "w", encoding="utf-8") as f:
+            f.write(f"<!-- 当前激活人格: {persona_name}（来源: {src}）。由 mkproject/cli/persona 生成，勿手编；关闭: `kit/cli/persona off`。 -->\n\n{body}\n")
+        return f"已激活人格: {persona_name}（→ personas/active.md）"
+
+    # 默认：继承源项目激活状态（源仓库根 personas/active.md）
+    # 与 main 中 src_tools_root 逻辑一致：--from 传 kit/ 时源根 = 其父级；否则即 kit_root
+    src_root = os.path.dirname(kit_root) if os.path.basename(kit_root) == "kit" else kit_root
+    src_active = os.path.join(src_root, "personas", "active.md")
+    if os.path.isfile(src_active):
+        shutil.copy(src_active, active)
+        return "已继承源激活人格（→ personas/active.md）"
+    return "无源激活人格（新项目零加载；启用: kit/cli/persona use <name>）"
+
+
+def ensure_persona_bridges(project, enable):
+    """enable=True 时确保工具薄壳桥接存在（.pi/.cursor/.github）；False 时移除。"""
+    sysmd = os.path.join(project, ".pi", "SYSTEM.md")
+    cursor_file = os.path.join(project, ".cursor", "rules", "persona.mdc")
+    copilot = os.path.join(project, ".github", "copilot-instructions.md")
+
+    sysmd_section = ("\n---\n\n## 对话人格（按需加载 · 表达层设定）\n\n"
+                     "> 当前激活人格见项目根 `personas/active.md`（未激活则零加载）。\n"
+                     "> 切换: `kit/cli/persona list | use <name> | off | show`。\n")
+    cursor_content = ("---\ndescription: 对话人格指路 — 按需加载见 personas/active.md\n---\n"
+                      "# 对话人格（按需加载 · 表达层设定）\n\n当前激活人格见项目根 `personas/active.md`（未激活则零加载）。"
+                      "切换: `kit/cli/persona list | use <name> | off | show`。\n")
+    copilot_line = "\n**对话人格**（按需加载 · 表达层设定）：当前激活人格见项目根 `personas/active.md`（未激活则零加载），切换用 `kit/cli/persona`；此处不重复。\n"
+
+    if enable:
+        if os.path.isfile(sysmd):
+            if "对话人格" not in open(sysmd, encoding="utf-8").read():
+                with open(sysmd, "a", encoding="utf-8") as f:
+                    f.write(sysmd_section)
+        else:
+            os.makedirs(os.path.dirname(sysmd), exist_ok=True)
+            with open(sysmd, "w", encoding="utf-8") as f:
+                f.write("# AIOS + Reliable AI Engineering Framework — System Prompt\n\n" + sysmd_section)
+        if not os.path.isfile(cursor_file):
+            os.makedirs(os.path.dirname(cursor_file), exist_ok=True)
+            with open(cursor_file, "w", encoding="utf-8") as f:
+                f.write(cursor_content)
+        if os.path.isfile(copilot):
+            if "对话人格" not in open(copilot, encoding="utf-8").read():
+                with open(copilot, "a", encoding="utf-8") as f:
+                    f.write(copilot_line)
+        else:
+            os.makedirs(os.path.dirname(copilot), exist_ok=True)
+            with open(copilot, "w", encoding="utf-8") as f:
+                f.write("# Copilot — 项目入口\n\n**入口**：`AGENTS.md`\n\n" + copilot_line)
+    else:
+        if os.path.isfile(sysmd):
+            t = open(sysmd, encoding="utf-8").read()
+            i = t.find("\n---\n\n## 对话人格")
+            if i >= 0:
+                t = t[:i].rstrip() + "\n"
+                with open(sysmd, "w", encoding="utf-8") as f:
+                    f.write(t)
+        if os.path.isfile(cursor_file):
+            os.remove(cursor_file)
+        if os.path.isfile(copilot):
+            t = open(copilot, encoding="utf-8").read()
+            out = [ln for ln in t.splitlines() if "**对话人格**" not in ln]
+            res = "\n".join(out)
+            while "\n\n\n" in res:
+                res = res.replace("\n\n\n", "\n\n")
+            with open(copilot, "w", encoding="utf-8") as f:
+                f.write(res)
 
 
 def main():
@@ -41,6 +156,10 @@ def main():
                     help=f"项目类型（{', '.join(PROFILES)}）")
     ap.add_argument("--from", dest="kit_root", default=KIT,
                     help="kit 源目录（默认本仓库）")
+    ap.add_argument("--persona", default=None, metavar="<name>",
+                    help="人格名：从人格库（源 kit/personas/ 或源 personas/）选一个激活，写入新项目 personas/active.md")
+    ap.add_argument("--no-persona", action="store_true",
+                    help="生成无个人格项目：移除 AGENTS.md 人格章节与工具薄壳桥接（默认继承源人格）")
     args = ap.parse_args()
 
     kit_root = os.path.abspath(args.kit_root)
@@ -109,8 +228,14 @@ def main():
     # 4. 项目根 AGENTS.md：从源仓库根复制完整框架导航（工具按项目根读取，非薄指针）
     src_agents = os.path.join(src_tools_root, "AGENTS.md")
     if os.path.isfile(src_agents):
-        shutil.copy(src_agents, os.path.join(project, "AGENTS.md"))
+        dest_agents = os.path.join(project, "AGENTS.md")
+        shutil.copy(src_agents, dest_agents)
         print("  ✓ AGENTS.md（完整框架导航）")
+        # 人格注入/移除（aibase 框架功能，TASK-008）
+        msg = apply_persona(project, args.persona, args.no_persona, kit_root)
+        if msg:
+            print(f"    · 人格：{msg}")
+        ensure_persona_bridges(project, enable=not args.no_persona)
     else:
         # 回退：生成最小入口（不依赖源仓库根的 AGENTS.md）
         agents_content = f"""# AGENTS.md — {os.path.basename(project)} 项目入口
@@ -131,6 +256,13 @@ def main():
             f.write(agents_content)
         print("  ✓ AGENTS.md（回退最小入口）")
 
+    # 4a. .gitattributes：从源仓库根复制（TASK-009）——新项目必须继承行尾规则，
+    #     否则 Windows 检出 CRLF 问题在生成的项目里复发。
+    src_attrs = os.path.join(src_tools_root, ".gitattributes")
+    if os.path.isfile(src_attrs):
+        shutil.copy(src_attrs, os.path.join(project, ".gitattributes"))
+        print("  ✓ .gitattributes（跨平台行尾规则）")
+
     # 4b. 入口文件对齐（与 cli/init 安装产物一致）：opencode.md + CLAUDE.md symlink
     src_opencode = os.path.join(src_tools_root, "opencode.md")
     if os.path.isfile(src_opencode):
@@ -138,8 +270,14 @@ def main():
         print("  ✓ opencode.md（项目根）")
     claude_link = os.path.join(project, "CLAUDE.md")
     if not os.path.lexists(claude_link):
-        os.symlink("AGENTS.md", claude_link)
-        print("  ✓ CLAUDE.md → AGENTS.md")
+        # TASK-005：Windows 无开发者模式/管理员权限时 os.symlink 抛 OSError——
+        # 降级为提示手动复制，不中断项目创建（与 cli/init 的 make_symlink 行为对齐）。
+        try:
+            os.symlink("AGENTS.md", claude_link)
+            print("  ✓ CLAUDE.md → AGENTS.md")
+        except OSError as e:
+            print(f"  · 无法创建 CLAUDE.md symlink（Windows 需开发者模式/管理员权限）: {e}")
+            print(f"    可手动创建: 将 {os.path.join(project, 'AGENTS.md')} 复制为 {claude_link}")
     elif not os.path.islink(claude_link):
         print("  · CLAUDE.md 已存在且非 symlink，保留不动")
 

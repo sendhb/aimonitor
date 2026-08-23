@@ -1,0 +1,32 @@
+# AIOS Framework — 跨平台行尾归一化（TASK-001）
+# 修复：仓库此前无 .gitattributes，Windows(autocrlf=true) 检出 CRLF / Linux 检出 LF，
+# 行尾完全依赖各机 git 配置，bash 脚本存在被 \r 损坏的风险。
+# 策略：* text=auto 让 git 自动归一化文本、自动识别二进制；脚本类强制 LF。
+
+* text=auto
+
+# —— 脚本类：一律 LF（shebang / 工具链要求；Git Bash 与 Linux 均可直接执行）——
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.py    text eol=lf
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# —— 无扩展名的 CLI 脚本 / git hooks（* text=auto 下会被 autocrlf 转 CRLF，必须显式 LF）——
+kit/cli/*      text eol=lf
+.githooks/*    text eol=lf
+
+# —— 文档 / 配置：统一 LF ——
+*.md    text eol=lf
+*.mdc   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.ini   text eol=lf
+*.cfg   text eol=lf
+
+# —— 工具链自身：LF ——
+.gitattributes text eol=lf
+.gitignore     text eol=lf

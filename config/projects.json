@@ -5,6 +5,7 @@
   "alert_blocked_ratio_threshold": 0.2,
   "alert_stale_task_days": 14,
   "ingest_rate_limit_per_minute": 60,
+  "register_rate_limit_per_minute": 60,
   "projects": [
     {
       "id": "aimonitor",

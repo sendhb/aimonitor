@@ -29,6 +29,13 @@ if [ "${1:-}" = "--unlock" ]; then
   MODE="unlock"
 fi
 
+# 平台检测（TASK-004）：Windows 上 chmod 只作用于 MSYS 模拟权限层，
+# 不阻止 Windows 原生工具（Claude Code/Cursor 等）写 NTFS——锁定仅提示性。
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+  *) IS_WINDOWS=0 ;;
+esac
+
 CONFIG="$ROOT/aios.config.yaml"
 if [ ! -f "$CONFIG" ]; then
   echo "✗ 未找到 $CONFIG" >&2
@@ -43,7 +50,15 @@ else
   LIBDIR="$ROOT/cli/lib"
 fi
 
-DIRS="$(python3 - "$LIBDIR" "$ROOT" <<'PYEOF'
+# python 解释器分派（TASK-002）：Windows 商店 stub / 缺失时回退 python
+# shellcheck source=cli/lib/pick_python.sh
+source "$LIBDIR/pick_python.sh"
+PY="$(pick_python)" || {
+  echo "✗ 需要 python3 或 python（请先安装并加入 PATH）" >&2
+  exit 1
+}
+
+DIRS="$("$PY" - "$LIBDIR" "$ROOT" <<'PYEOF'
 import sys
 sys.path.insert(0, sys.argv[1])
 import config
@@ -67,7 +82,11 @@ while IFS= read -r d; do
   fi
   if [ "$MODE" = "lock" ]; then
     chmod -R a-w "$target"
-    echo "✓ 已锁只读: $d"
+    if [ "$IS_WINDOWS" = "1" ]; then
+      echo "⚠ 已执行 chmod（仅 MSYS 模拟层）；NTFS 不阻止 Windows 原生工具写入，锁定为提示性（TASK-004）: $d"
+    else
+      echo "✓ 已锁只读: $d"
+    fi
   else
     chmod -R u+w "$target"
     echo "✓ 已解锁: $d"

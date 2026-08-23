@@ -12,6 +12,6 @@ generated_dirs:
 commands:
   build: bash scripts/build.sh
   lint: node --check src/js/main.js && python3 -m py_compile server/monitor_server.py
-  test: node test/hello.test.js && python3 test/server_smoke.py
+  test: node test/hello.test.js && python3 test/server_smoke.py && python3 test/registration_test.py --coverage && python3 test/security_test.py
   check: test -f dist/index.html && test -f dist/css/style.css && test -f dist/js/main.js && grep -q "aimonitor" dist/index.html && grep -q "task-table" dist/index.html
   start: bash scripts/start.sh

@@ -164,6 +164,409 @@ aimonitor 服务端
 - **展示**：项目总览一行一实例（同 `group` 多行可见）；`group` 字段供前端分组/折叠（可选项，非本期必做）
 - **趋势/告警**：实例独立采样/告警；跨实例对比属前端可选项
 
+## 3.2 注册-审批-签发（自助注册，动态签发 token）
+
+> 目标：让被监控机器通过**自助注册 + 管理员审批**的方式加入 aimonitor，
+> 无需预先手工编辑 `config/projects.json` 和 `config/agents.json`。
+> 管理员通过 dashboard 页面确认/拒绝，审批通过后自动签发 token。
+
+### 3.2.1 数据流
+
+```
+被监控机器 agent（未注册）
+  │  POST /api/register { project_id, path, host_info, request_key, enrollment_code? }
+  ▼
+服务端 → 校验 → 写入 registration_request(status=pending)
+  │  返回 { req_id, status: "pending" }
+  ▼
+agent 定期轮询 GET /api/register/:req_id/status?request_key=xxx
+  │  （pending 状态 → 继续轮询）
+  ▼
+管理员在 dashboard 看到申请队列
+  │  POST /api/register/:req_id/approve { admin_password }
+  ▼
+服务端 → 校验 admin_password → TokenIssuer 签发 token（scope=该 project_id 唯一）
+  │  → 写入 config/agents.json（权限 600）→ 标记 status=approved
+  ▼
+agent 轮询到 status=approved → 拿到 token → 写入 agent.json → 切换 state=active
+  │  → 开始正式推送（复用现有 ingest 链路）
+  ▼
+POST /api/ingest（正常推送，与现有行为一致）
+```
+
+### 3.2.2 状态机
+
+```
+                  ┌──────────────────┐
+                  │  unregistered    │  agent 初始状态，无 token
+                  └────────┬─────────┘
+                           │ 注册
+                           ▼
+                  ┌──────────────────┐
+                  │  pending         │  等待管理员审批
+                  └────────┬─────────┘
+                      ┌───┴───┐
+                      ▼       ▼
+              ┌──────────┐ ┌──────────┐
+              │ approved │ │ rejected │
+              │ (active) │ │          │
+              └────┬─────┘ └────┬─────┘
+                   │            │ 冷却后重试
+                   ▼            ▼
+              ┌──────────┐ ┌──────────┐
+              │ revoked  │ │ expired  │  pending TTL 超时
+              └──────────┘ └──────────┘
+```
+
+- `pending` → `approved`（管理员确认）→ `revoked`（管理员吊销）
+- `pending` → `rejected`（管理员拒绝）→ 可重新注册
+- `pending` → `expired`（TTL 超时，缺省 7 天）→ 可重新注册
+- `approved` → `revoked`（管理员吊销 token）
+
+### 3.2.3 注册申请存储（`registration_request` 表）
+
+SQLite 表 `registration_request`，存放于 `data/registration.db`：
+
+```sql
+CREATE TABLE registration_request (
+  req_id          TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL,
+  path            TEXT,                   -- 申请 payload 的被监控项目路径（展示/自动登记用，TASK-069）
+  enrollment_code TEXT,
+  host_info       TEXT NOT NULL,          -- JSON: {hostname, ip, user_agent, ts}
+  request_key     TEXT NOT NULL,          -- 客户端 secret，用于轮询绑定身份（服务端存 hash）
+  status          TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected|expired|revoked
+  issued_token    TEXT,                   -- 审批通过时签发的 token（hash 存储）
+  token_delivered INTEGER DEFAULT 0,      -- 单次交付标记（status 端点首次返回后置 1）
+  renew_count     INTEGER DEFAULT 0,      -- 已轮换次数（renew 防重复守卫，>0 时 renew → 409）
+  created_at      REAL NOT NULL,
+  decided_at      REAL,
+  expire_at       REAL NOT NULL,           -- pending TTL
+  UNIQUE(project_id)                      -- 同 id 只能有一个活跃申请
+);
+```
+
+状态机约束：
+- `pending → approved|rejected|expired`
+- `approved → revoked`
+- `rejected → noop`（可重新注册）
+- `expired → noop`（可重新注册）
+
+### 3.2.4 注册码（Enrollment Code）表
+
+SQLite 表 `enrollment_code`，存放于同一 DB：
+
+```sql
+CREATE TABLE enrollment_code (
+  code                    TEXT PRIMARY KEY,
+  description             TEXT,
+  allowed_project_pattern TEXT,            -- 可选 glob: "baseline-*"
+  max_uses                INTEGER DEFAULT 1,
+  use_count               INTEGER DEFAULT 0,
+  created_at              REAL NOT NULL,
+  expire_at               REAL,
+  revoked                 INTEGER DEFAULT 0
+);
+```
+
+注册码是预授权信任锚：注册请求携带注册码时，管理员在审批页面看到 🔵 预授权标记；
+无码时为 🟡 盲申请。注册码不是 token，泄露后管理员可吊销重发。
+
+### 3.2.5 管理员认证
+
+简化版（局域网适用）：
+- 配置文件 `config/admin.json`（权限 600，gitignored）：`{ "admin_password": "<随机密码>" }`
+- 首次启动时若文件不存在，自动生成 32 字符随机密码并 stdout 打印一次
+- 审批端点均要求 `Authorization: Bearer <admin_password>`
+- 前端审批区要求输入一次密码，sessionStorage 暂存
+
+未来迁广域网时可升级为 Bearer token 系统（含签发/吊销/轮换）。
+
+### 3.2.6 API 端点契约
+
+#### `POST /api/register`（公开，无 token 鉴权）
+
+注册端点，接收 agent 注册申请。
+
+| 项 | 值 |
+|----|----|
+| 方法 | `POST /api/register` |
+| 鉴权 | 无（公开端点，全局限流 60 次/分钟，可配置） |
+| Content-Type | `application/json` |
+
+请求体：
+```json
+{
+  "project_id": "baseline-dev",
+  "path": "/home/dev/code/baseline",
+  "host_info": "hostname:dev-box, ip:192.168.1.5",
+  "request_key": "<agent-生成的随机密钥>",
+  "enrollment_code": "ABC123-XYZ789"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `project_id` | ✅ | 实例级唯一 id（如 baseline-dev） |
+| `path` | ✅ | 被监控项目路径（展示用） |
+| `host_info` | ✅ | 机器标识信息（hostname, IP, user-agent, ts） |
+| `request_key` | ✅ | 客户端自生成随机密钥，用于轮询时绑定身份（最小 16 字节） |
+| `enrollment_code` | — | 可选，预授权注册码 |
+
+响应：
+
+| 状态码 | 条件 | 响应体 |
+|--------|------|--------|
+| 201 | 注册成功 | `{ "req_id": "<uuid>", "status": "pending", "pending_since": <epoch> }` |
+| 400 | 请求体格式错误 | `{ "error": "..." }` |
+| 409 | project_id 已存在（已注册/活跃中） | `{ "error": "project_id 已存在", "existing": "active|pending" }` |
+| 429 | 限流 | `{ "error": "rate limit" }` |
+
+校验逻辑：
+1. 全局限流（60 次/分钟，可配置）
+2. Schema 校验：project_id 格式（字母数字连字符）、request_key 最小长度
+3. project_id 已存在于 projects.json 或 ingest_state 活跃 → 409
+4. 同 project_id 已有 pending 申请 → 409
+5. enrollment_code 存在 → 校验并标记"预授权"
+6. 写入 registration_request → 返回 201
+
+#### `GET /api/register/:req_id/status`（公开，需 request_key 绑定）
+
+Agent 轮询审批结果。
+
+| 项 | 值 |
+|----|----|
+| 方法 | `GET /api/register/:req_id/status?request_key=<key>` |
+| 鉴权 | 无（公开，但 request_key 绑定 req_id） |
+
+响应：
+
+| 状态 | 响应体 |
+|------|--------|
+| pending | `{ "status": "pending", "pending_since": <epoch> }` |
+| approved | `{ "status": "approved", "token": "<token>", "project_id": "<id>" }`（token 仅返回一次） |
+| rejected | `{ "status": "rejected", "reason": "..." }` |
+| expired | `{ "status": "expired" }` |
+| revoked | `{ "status": "revoked" }` |
+
+安全设计：
+- request_key 不匹配 → 404（不泄露 req_id 存在）
+- token 仅在首次返回 approved 时交付一次，标记 `token_delivered=true`，后续不再返回
+- token 仅在 HTTPS 响应中传输（局域网 HTTP 可用，但建议局域网内也注意）
+
+#### `POST /api/register/:req_id/approve`（管理员认证）
+
+管理员确认注册申请。
+
+| 项 | 值 |
+|----|----|
+| 方法 | `POST /api/register/:req_id/approve` |
+| 鉴权 | `Authorization: Bearer <admin_password>` |
+| 请求体 | `{ "note": "可选备注" }` |
+
+处理逻辑：
+1. 校验 admin_password → 401
+2. req_id 不存在 → 404
+3. status 不是 pending → 409（已处理）
+4. TokenIssuer 签发 token（scope=该 project_id 唯一）
+5. 写入 config/agents.json（600）
+6. 更新 status=approved, issued_token, decided_at
+7. 如 enrollment_code 存在 → 调用 consume（+1 use_count）
+8. **自动登记 projects.json**（TASK-069）：把 project_id 写入 config/projects.json
+   （`{id, name, path, transport: "agent"}`，path 取申请 payload 的 path，缺省兜底为
+   project_id），并同步内存 config → 审批后 agent 推送不再 400 "project_id 未注册"，
+   且无需重启服务即被轮询/ingest 识别。幂等（已存在不重复追加）；失败 best-effort
+   告警不阻断审批（与步骤 7 语义一致）。
+9. 返回 `{ "status": "approved", "req_id": "<id>", "project_id": "<id>" }`
+
+#### `POST /api/register/:req_id/reject`（管理员认证）
+
+管理员拒绝注册申请。
+
+| 项 | 值 |
+|----|----|
+| 方法 | `POST /api/register/:req_id/reject` |
+| 鉴权 | `Authorization: Bearer <admin_password>` |
+| 请求体 | `{ "reason": "拒绝原因" }` |
+
+返回 `{ "status": "rejected", "req_id": "<id>" }`。
+
+#### `POST /api/register/:req_id/revoke`（管理员认证）
+
+吊销已批准的 token。
+
+| 项 | 值 |
+|----|----|
+| 方法 | `POST /api/register/:req_id/revoke` |
+| 鉴权 | `Authorization: Bearer <admin_password>` |
+
+处理逻辑：
+1. status 必须是 approved → 否则 409
+2. 从 config/agents.json 移除该 token
+3. 更新 status=revoked, decided_at
+4. 返回 `{ "status": "revoked" }`
+
+#### `POST /api/register/:req_id/renew`（管理员认证）
+
+轮换 token：吊销旧 + 签发新。
+
+| 项 | 值 |
+|----|----|
+| 方法 | `POST /api/register/:req_id/renew` |
+| 鉴权 | `Authorization: Bearer <admin_password>` |
+
+处理逻辑：
+1. 同 revoke 逻辑吊销旧 token
+2. TokenIssuer 签发新 token（同 project_id）
+3. 写入 agents.json
+4. 返回 `{ "status": "approved", "note": "新 token 已签发，agent 下次推送时收到 401 后自动轮询领取" }`
+
+状态守卫：仅当 status='approved' 且 `renew_count=0` 时可轮换（重复 renew → 409）；
+轮换成功后 `renew_count` +1、`token_delivered` 重置为 0（agent 通过 status 端点领取新 token）。
+
+### 3.2.7 Token 签发
+
+`TokenIssuer` 类：
+
+- `issue(project_id) → { token, project_id, scope }`
+- token 格式：`aimon_{project_id}_{uuid4}_{random_hex}`（可识别来源，可审计）
+- 写入 `config/agents.json`（600），格式兼容现有：
+  ```json
+  { "baseline-dev": "aimon_baseline-dev_xxx_yyy" }
+  ```
+- 单次交付：token 仅通过审批响应 / status 轮询返回一次，不落页面存储、不入日志、不入提示词
+- 吊销时从 agents.json 移除
+- 生成用 `secrets.token_urlsafe(32)`（密码学安全随机）
+
+### 3.2.8 前端页面
+
+侧边栏新增「📋 注册申请」入口（badge 显示 pending 数量），包含：
+
+**申请队列**（只读，TASK-055）：
+- 列表：project_id、host_info（hostname + IP）、时间、状态
+- 标记：🔵 预授权（有 enrollment_code）/ 🟡 盲申请（无码）/ ✅ 已批准 / ❌ 已拒绝 / ⏳ 已过期 / 🔒 已吊销
+- 数据来源：`GET /api/register/list?status=pending`（需 admin_password 认证）
+
+**审批操作**（TASK-056）：
+- 点击行展开详情：project_id、path、host_info、申请时间、注册码（如有）、状态
+- 操作按钮：✅ 确认 / ❌ 拒绝 / 🔒 吊销 / 🔄 轮换
+- 首次打开审批区时，弹出 admin_password 输入框，sessionStorage 暂存
+
+**注册码管理**（TASK-057）：
+- 子 tab：申请队列 / 注册码管理
+- 注册码列表：code、description、allowed_project、max_uses/use_count、expire_at、status
+- 操作：生成注册码（表单）、吊销
+
+### 3.2.9 安全假设（局域网）
+
+| 项 | 假设 |
+|----|------|
+| 网络 | 局域网内 HTTP 通信，不强制 HTTPS |
+| 威胁模型 | 内部用户误操作 > 恶意攻击；不防 LAN 内撞库/嗅探 |
+| 管理员认证 | 简单密码，够防手滑即可 |
+| 限流 | 全局限流防 bug 死循环，不防 DDoS |
+| 未来迁移 | 迁广域网时需补充：HTTPS 反代、IP 级限流、枚举防护、token 系统升级 |
+
+### 3.2.10 aibase 接口契约（供 aibase 侧实现 agent 注册功能）
+
+> 本附录仅包含 aibase 的 agent 组件需要实现的 API 契约和状态机定义。
+> aimonitor 内部实现细节（存储表结构、前端 UI、admin 认证）不在此列出。
+
+#### Agent 状态机
+
+```
+unregistered → pending → approved (active)
+                       → rejected → retry
+                       → expired → re-register
+approved → revoked → re-register
+```
+
+#### agent.json 新增字段
+
+| 字段 | 必填 | 缺省 | 说明 |
+|------|------|------|------|
+| `state` | — | `active` | agent 状态：`unregistered` / `pending` / `active`。缺省 `active` 兼容存量 agent |
+| `req_id` | — | — | 注册成功后服务端返回的申请 ID，pending 状态下存在 |
+| `request_key` | — | — | agent 自生成的随机密钥，用于轮询时绑定身份（pending 状态下存在） |
+
+`state=unregistered` 时，`token` 字段可为空；`state=active` 时，`token` 必填（与现有校验一致）。
+
+#### CLI 新增子命令
+
+```bash
+python3 agent.py --register [--enrollment-code CODE] [--config agent.json]
+  # 注册流程：构造请求 → POST /api/register → 进入 pending 状态 → 开始轮询
+
+python3 agent.py --register --status
+  # 查看当前注册状态（unregistered/pending/active）
+```
+
+#### POST /api/register 契约（agent 视角）
+
+| 项 | 值 |
+|----|----|
+| URL | `POST <server_url>/../register`（server_url 的 `/api/ingest` 替换为 `/api/register`） |
+| Content-Type | `application/json` |
+
+请求体：
+```json
+{
+  "project_id": "baseline-dev",
+  "path": "/home/dev/code/baseline",
+  "host_info": "hostname:dev-box, ip:192.168.1.5",
+  "request_key": "<随机密钥>",
+  "enrollment_code": "ABC123-XYZ789"
+}
+```
+
+响应：
+
+| 状态码 | 响应体 | agent 行为 |
+|--------|--------|-----------|
+| 201 | `{ "req_id": "<uuid>", "status": "pending", "pending_since": <epoch> }` | 保存 req_id，切换到 pending 状态，开始轮询 |
+| 409 | `{ "error": "...", "existing": "active|pending" }` | 已注册 → 提示用户；已存在 pending → 继续轮询旧 req_id |
+| 400/429 | `{ "error": "..." }` | 退避重试 |
+
+#### GET /api/register/:req_id/status 契约（agent 视角）
+
+| 项 | 值 |
+|----|----|
+| URL | `GET <server_url>/../register/<req_id>?request_key=<key>` |
+
+响应：
+
+| 状态码 | 响应体 | agent 行为 |
+|--------|--------|-----------|
+| 200 pending | `{ "status": "pending", "pending_since": <epoch> }` | 继续轮询（间隔 30s） |
+| 200 approved | `{ "status": "approved", "token": "<token>", "project_id": "<id>" }` | 保存 token，写入 agent.json，切换 state=active，开始正式推送 |
+| 200 rejected | `{ "status": "rejected", "reason": "..." }` | 打印错误，退出（或等待人工介入） |
+| 200 expired | `{ "status": "expired" }` | 提示重新注册 |
+| 200 revoked | `{ "status": "revoked" }` | 提示重新注册 |
+| 404 | — | request_key 不匹配或 req_id 不存在 → 退避重试 |
+
+#### Token 格式
+
+```
+aimon_{project_id}_{uuid4}_{random_hex}
+```
+
+示例：`aimon_baseline-dev_550e8400-e29b-41d4-a716-446655440000_a1b2c3d4`
+
+- 前缀 `aimon_` 便于识别来源
+- 中段 `project_id` 便于审计
+- 后段 `uuid4` + `random_hex` 保证不可猜测
+
+#### 轮询失败处理
+
+| 失败类型 | 行为 |
+|---------|------|
+| 网络错误/超时 | 指数退避（复用现有 `agent_retry.py`），最长 60s cap |
+| 4xx（不含 404） | 不重试，打印错误，退出 |
+| 404 | 退避重试（可能 req_id 尚未同步），3 次后退出 |
+| pending TTL 超时 | 打印提示，退出（重新注册） |
+
+---
+
 ## 4. 聚合 JSON 模型（`GET /api/status`）
 
 ```json

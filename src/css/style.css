@@ -455,3 +455,230 @@ td:first-child { max-width: 380px; }
   .sidebar-mask { display: none !important; }
 }
 
+/* ===== 注册申请页面（TASK-055） ===== */
+#registration-page { margin-bottom: 16px; }
+#registration-table td { white-space: nowrap; }
+#registration-table tbody tr { cursor: pointer; }
+#registration-table tbody tr:hover { background: var(--bg-hover); }
+.status-badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 10px; font-size: 11.5px; font-weight: 500; }
+.status-badge.pending { background: rgba(255, 193, 7, .15); color: #f0ad4e; }
+.status-badge.approved { background: rgba(76, 175, 80, .15); color: #66bb6a; }
+.status-badge.rejected { background: rgba(244, 67, 54, .15); color: #ef5350; }
+.status-badge.expired { background: rgba(158, 158, 158, .15); color: #bdbdbd; }
+.status-badge.revoked { background: rgba(158, 158, 158, .15); color: #bdbdbd; }
+.tag-badge { display: inline-flex; align-items: center; gap: 2px; padding: 1px 6px; border-radius: 8px; font-size: 11px; font-weight: 500; }
+.tag-badge.preauth { background: rgba(33, 150, 243, .15); color: #42a5f5; }
+.tag-badge.blind { background: rgba(255, 193, 7, .15); color: #ffd54f; }
+
+/* Admin 密码弹窗 */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal-overlay:not(.hidden) { display: flex; }
+.modal-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  width: 360px; max-width: 90vw;
+  box-shadow: 0 12px 40px rgba(0,0,0,.35);
+}
+.modal-box h3 { margin: 0 0 8px; font-size: 16px; }
+.modal-box p { color: var(--text-dim); font-size: 13px; margin: 0 0 16px; }
+.modal-box input[type="password"] {
+  width: 100%; box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+}
+.modal-box input[type="password"]:focus { border-color: var(--accent); }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+.modal-actions .btn { padding: 8px 20px; font-size: 13px; }
+
+/* TASK-056: 审批操作按钮区域 */
+.reg-action-area {
+  margin: 16px 0 0;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.reg-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: opacity .15s, background .15s;
+  flex: 1;
+  justify-content: center;
+  min-width: 100px;
+}
+.reg-action-btn:hover { background: var(--bg-hover); }
+.reg-action-btn:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.reg-action-btn.loading {
+  opacity: .7;
+  pointer-events: none;
+}
+.reg-action-btn.approve { border-color: var(--ok); color: var(--ok); }
+.reg-action-btn.approve:hover { background: rgba(63, 185, 80, .1); }
+.reg-action-btn.reject { border-color: var(--err); color: var(--err); }
+.reg-action-btn.reject:hover { background: rgba(248, 81, 73, .1); }
+.reg-action-btn.revoke { border-color: var(--warn); color: var(--warn); }
+.reg-action-btn.revoke:hover { background: rgba(210, 153, 34, .1); }
+.reg-action-btn.renew { border-color: var(--accent); color: var(--accent); }
+.reg-action-btn.renew:hover { background: rgba(110, 168, 254, .1); }
+
+/* TASK-056: 审批操作成功/错误消息 */
+.reg-action-msg {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  margin-top: 8px;
+}
+.reg-action-msg.success { background: rgba(63, 185, 80, .1); color: var(--ok); }
+.reg-action-msg.error { background: rgba(248, 81, 73, .1); color: var(--err); }
+
+/* TASK-056: 列表拒绝原因（UI-003） */
+.reg-list-reason {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+/* TASK-056: 弹窗文本域 */
+.modal-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+  outline: none;
+  resize: vertical;
+  min-height: 60px;
+}
+.modal-textarea:focus { border-color: var(--accent); }
+
+/* 注册详情抽屉 */
+#reg-detail-panel .reg-detail-section { margin: 12px 0; }
+#reg-detail-panel .reg-detail-section h4 { font-size: 13px; margin: 0 0 4px; color: var(--text-dim); }
+#reg-detail-panel .reg-detail-section .reg-detail-value { font-size: 13px; word-break: break-all; }
+#reg-detail-panel .reg-detail-section .reg-detail-value.mono { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+#reg-detail-panel .history-list { list-style: none; padding: 0; margin: 0; }
+#reg-detail-panel .history-list li { padding: 4px 0; font-size: 12.5px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+#reg-detail-panel .history-list li:last-child { border-bottom: 0; }
+
+/* ===== TASK-057: 注册码管理 ===== */
+
+/* 子 tab */
+.reg-tabs {
+  display: flex; gap: 0; margin-bottom: 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.reg-tab {
+  border: 0; background: transparent; color: var(--text-faint);
+  padding: 8px 18px; font-size: 13px; font-family: var(--font);
+  cursor: pointer; border-bottom: 2px solid transparent;
+  margin-bottom: -1px; transition: color .15s, border-color .15s;
+}
+.reg-tab:hover { color: var(--text-dim); }
+.reg-tab.active {
+  color: var(--text); font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.reg-pane { min-height: 80px; }
+
+/* 注册码工具栏 */
+.reg-codes-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px; gap: 10px;
+}
+
+/* 注册码表格 */
+#reg-codes-table td { white-space: nowrap; }
+#reg-codes-table tbody tr { cursor: default; }
+
+/* 注册码掩码（hover 显示完整） */
+.reg-code-masked {
+  cursor: help;
+  border-bottom: 1px dashed var(--text-faint);
+}
+.reg-code-masked:hover {
+  color: var(--accent);
+}
+
+/* 注册码状态 */
+.reg-code-status {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 10px; font-size: 11.5px; font-weight: 500;
+}
+.reg-code-status.active { background: rgba(76, 175, 80, .15); color: #66bb6a; }
+.reg-code-status.revoked { background: rgba(244, 67, 54, .15); color: #ef5350; }
+.reg-code-status.expired { background: rgba(158, 158, 158, .15); color: #bdbdbd; }
+
+/* 注册码操作按钮 */
+.reg-code-revoke-btn {
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text-dim); padding: 2px 10px; border-radius: 6px;
+  font-size: 11.5px; cursor: pointer; font-family: var(--font);
+}
+.reg-code-revoke-btn:hover {
+  border-color: var(--err); color: var(--err);
+}
+.reg-code-revoke-btn:disabled {
+  opacity: .4; cursor: not-allowed;
+}
+
+/* 生成注册码表单 */
+.reg-form { display: flex; flex-direction: column; gap: 10px; }
+.reg-form-label {
+  font-size: 12.5px; font-weight: 500; color: var(--text-dim);
+}
+.reg-form-required { color: var(--err); }
+.reg-form-input {
+  width: 100%; box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-card); color: var(--text);
+  font-size: 13px; font-family: var(--font); outline: none;
+}
+.reg-form-input:focus { border-color: var(--accent); }
+.reg-form-input[type="date"] { color-scheme: dark; }
+.reg-form-hint { font-size: 11px; color: var(--text-faint); margin-top: -4px; }
+.reg-form-err { font-size: 11.5px; color: var(--err); }
+
+/* 生成结果展示 */
+.reg-code-result-box {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px; margin: 10px 0;
+}
+.reg-code-result-code {
+  flex: 1; font-family: var(--mono); font-size: 14px;
+  color: var(--accent); word-break: break-all;
+  user-select: all;
+}
+

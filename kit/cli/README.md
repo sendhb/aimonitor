@@ -6,11 +6,14 @@
 
 | 命令 | 功能 | 实现 |
 |------|------|------|
-| `init` | 安装模板到目标项目 | `cli/init` |
+| `mkproject` | 用 kit/ 布局创建新项目；支持 `--profile`、`--persona <name>`（从人格库激活）、`--no-persona`（零加载）、`--from <kit-root>` | `cli/mkproject` |
+| `persona` | 人格切换（按需加载）：`list` / `use <name>` / `off` / `show` | `cli/persona`（Python 3） |
+| `init` | 安装模板到目标项目（Python 跨平台：Windows 可 `python cli/init`；`--install-deps` 自动按平台装 git/python） | `cli/init` |
 | `task` | 任务生命周期管理 | `cli/task`（Python 3，用 `./cli/task` 调用，勿用 `bash cli/task`） |
 | `task verify` | 真实执行 `aios.config.yaml` 的 build/lint/test/check，通过才生成 VERIFY 记录（不是自证） | `cli/task verify TASK-xxx` |
 
 > **调用注意**：`cli/task` 是 Python 3 脚本，请用 `./cli/task <子命令>` 或 `python3 cli/task <子命令>`；
+> **Windows**：请用 `python cli\task <子命令>`（`python3` 常是 Microsoft Store stub，不可用）；
 > 不要用 `bash cli/task <子命令>` —— bash 会把 Python 源码当 shell 逐行解析，产生巨量输出并死循环（脚本已自带防护）。
 | `check` | 框架健康与 TASK 格式检查 | `cli/check` |
 | `protect` | 把 `generated_dirs` chmod 成只读（`--unlock` 反向解锁） | `cli/protect [--unlock]` |

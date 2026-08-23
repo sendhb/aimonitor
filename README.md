@@ -102,9 +102,15 @@ bash scripts/stop.sh     # 或手动 kill PID
 }
 ```
 
+> 自助注册（审批后动态签发 token）已上线服务端与审批页，见下文「快速添加被监控机器」
+> 与 `docs/OPERATIONS.md` §7。**agent 端自动注册客户端（`--register` 子命令、
+> `state=unregistered` 配置、自动轮询/自动领取 token）尚未实现**——当前 agent 仅支持
+> 已有 token 的推送，注册需按 API 手工完成（见下文）。
+
 ```bash
-python3 kit/tools/agent/agent.py --config /etc/aios/agent.json   # 常驻推送
+python3 kit/tools/agent/agent.py --config /etc/aios/agent.json   # 常驻推送（已有 token）
 python3 kit/tools/agent/agent.py --check-config --config ...     # 只校验配置
+python3 kit/tools/agent/agent.py --once --config agent.json      # 单轮推送（cron/timer）
 ```
 
 systemd / systemd timer / nohup / Windows Task Scheduler 部署方式见 `aibase/kit/tools/agent/README.md`。
@@ -114,6 +120,99 @@ systemd / systemd timer / nohup / Windows Task Scheduler 部署方式见 `aibase
 - 仪表盘 `/api/status`：agent 项目状态与 local 项目一致（任务/焦点/心跳/事件/计数）
 - agent 整体离线 → 项目 `error: "agent 离线"`（`last_seen` 超 `heartbeat_stale_threshold_seconds`，本项目配置 900s）
 - 多实例：同一逻辑项目多机器 = 多 id（`baseline-dev` / `baseline-prod`，可选 `group` 分组）；禁止共享 id（双 agent 抢推 → 409）
+
+## 快速添加被监控机器（自助注册）
+
+> 规格见 `docs/MONITOR-SPEC.md` §3.2（注册-审批-签发）。
+> 运维详情见 `docs/OPERATIONS.md` §7（注册审批流程）。
+> ⚠ **能力边界**：服务端注册/审批/签发 API 与审批页已实现；**agent 端自动注册客户端
+> （`--register` / `state=unregistered` / 自动轮询领 token）尚未实现**（依赖 aibase
+> agent 组件，MONITOR-SPEC §3.2.10）。以下按当前可用 API 手工完成。
+
+### 5 步流程
+
+**第 1 步：管理员首次启动**
+
+服务端首次启动自动生成 `config/admin.json`（32 字符随机密码），stdout **单行**输出
+`Admin password: <hex>`，立即保存到密码管理器。
+
+**第 2 步：管理员生成注册码（可选）**
+
+dashboard → 📋 注册申请 → 注册码管理 → 生成注册码；
+或命令行 `POST /api/register/codes/generate`（Bearer admin_password，见 OPERATIONS §7.3）。
+有码的申请标记 🔵 预授权，审批更快。
+
+**第 3 步：被监控机器发起注册申请**
+
+agent 端自动注册客户端未实现，当前用 API 发起（`request_key` 为 ≥16 字节随机串，务必保存）：
+
+```bash
+curl -X POST http://<aimonitor-host>:3113/api/register \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "baseline-dev", "path": "/home/user/code/baseline",
+       "host_info": "hostname:dev-box, ip:192.168.1.20",
+       "request_key": "<随机串>", "enrollment_code": "<注册码，可选>"}'
+# → 201 {"req_id": "R000001", "status": "pending", "pending_since": 1755691200.0}
+```
+
+**第 4 步：管理员审批**
+
+dashboard → 📋 注册申请 → 申请队列 → 查看详情 → ✅ 确认（输入 admin_password）；
+或命令行 `POST /api/register/R000001/approve`（Bearer admin_password）。
+
+**第 5 步：领取 token 并上线**
+
+```bash
+# 轮询审批结果（首次 approved 返回 token，仅一次）
+curl "http://<aimonitor-host>:3113/api/register/R000001/status?request_key=<随机串>"
+# → {"status": "approved", "token": "aimon_...", "project_id": "baseline-dev"}
+```
+
+1. 将 token 写入被监控机器 `agent.json`（普通推送配置，见上节），`chmod 600`
+2. **projects.json 已自动登记**（TASK-069：审批通过即写入 `transport: "agent"`，无需手工编辑/重启）；
+   若确认未登记，可手工补 `config/projects.json` 后重启服务端
+3. 启动 agent 推送：`python3 kit/tools/agent/agent.py --config agent.json`
+4. 仪表盘 `/api/status` 中该项目的状态与 local 项目一致
+
+> 等 aibase 交付 agent 注册客户端后，被监控端可简化为一行 `agent.py --register`，
+> 自动轮询审批结果并领取 token；当前需按第 5 步手工完成。
+
+## 常见问题
+
+### 注册被拒绝
+
+管理员拒绝后，该申请的 `status=rejected`，原因在申请列表/详情中展示
+（`GET /api/register/list`）。
+
+**处置：**
+
+1. 确认拒绝原因（如 project_id 冲突、非授权机器）
+2. 修改 `agent.json` 中的 project_id 或补充 enrollment_code
+3. 重新发起注册申请（`POST /api/register`；rejected 后可复用同 project_id）
+
+### Token 丢失
+
+agent 拿到 token 后写入 `agent.json` 本地文件。若文件损坏或丢失，agent 会持续收到 401
+（401 是**不可重试**错误，agent 退避报错，**不会自动恢复**）。
+
+**处置：**
+
+1. 管理员在 dashboard 找到该项目的已批准申请，点击「🔄 轮换」
+   （或命令行 `POST /api/register/:req_id/renew`）
+2. 轮换后新 token 已写入 agents.json；用原 request_key 轮询 status 端点领取（单次交付）：
+   `curl "http://<aimonitor-host>:3113/api/register/R000001/status?request_key=<key>"`
+3. 手动更新 `agent.json` 的 token → 重启 agent
+
+### 机器更换
+
+被监控机器故障或更换硬件后，原 project_id 对应的 token 在新机器上不存在。
+
+**处置：**
+
+1. 管理员在 dashboard 中吊销旧机器的 token（🔒 吊销）
+2. 新机器上用**新的 project_id** 配置 `agent.json` 并走「快速添加被监控机器」流程注册
+3. 注意：复用原 project_id 需先吊销旧 token，且该 id 不能在 projects.json 或有活跃
+   推送记录（否则注册返回 409）；当前实现无清除历史记录的接口，机器更换建议使用新 id
 
 ## 配套命令
 
@@ -132,3 +231,13 @@ systemd / systemd timer / nohup / Windows Task Scheduler 部署方式见 `aibase
 - Node.js（仅用于 lint/test 前端 JS）
 
 *维护：AIOS Framework。项目结构说明见 `AGENTS.md`。*
+
+## 署名
+
+- **作者 / Maintainer**：hb <sendhb@21cn.com>
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE) 发布。
+
+Copyright (c) 2026 hb <sendhb@21cn.com>

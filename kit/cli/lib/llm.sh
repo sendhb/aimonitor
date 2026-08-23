@@ -30,9 +30,16 @@ case "$PROVIDER" in
   deepseek)
     # codewhale agent CLI（原 deepseek-tui，TASK-009）：等效于 claude -p --dangerously-skip-permissions
     # key 优先用环境变量 DEEPSEEK_API_KEY，否则从 pi 配置 models.json 读取
+    # （解释器分派 TASK-002：Windows 商店 stub / 缺失时回退 python）
     if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -f "$HOME/.pi/agent/models.json" ]; then
-      DEEPSEEK_API_KEY=$(python3 -c "import json; d=json.load(open('$HOME/.pi/agent/models.json')); print(d['providers']['deepseek']['apiKey'])" 2>/dev/null || true)
-      export DEEPSEEK_API_KEY
+      # shellcheck source=cli/lib/pick_python.sh
+      source "$(dirname "${BASH_SOURCE[0]}")/pick_python.sh"
+      # SMELL-001（TASK-012）：set -e 下无 || 保护会静默退出；降级为警告并继续
+      py="$(pick_python)" || { echo "⚠ llm.sh: 缺少 python3/python，无法从 pi 配置读取 deepseek key" >&2; py=""; }
+      if [ -n "$py" ]; then
+        DEEPSEEK_API_KEY=$("$py" -c "import json; d=json.load(open('$HOME/.pi/agent/models.json')); print(d['providers']['deepseek']['apiKey'])" 2>/dev/null || true)
+        export DEEPSEEK_API_KEY
+      fi
     fi
     exec codewhale exec --auto "$PROMPT"
     ;;

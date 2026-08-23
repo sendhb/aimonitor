@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ====================================================================
+# persona — 人格切换 CLI（AIOS + Reliable AI Engineering Framework）
+#
+# 按需加载：人格内容不内嵌在 AGENTS.md，而是收在人格库，
+# 激活时复制一份到项目根 personas/active.md，工具只读该一个文件。
+# 未激活（无 active.md）= 零加载。
+#
+# 用法:
+#   persona list                  列出可用人格（框架库 + 项目库）
+#   persona use <name>            激活人格 → 写入 personas/active.md
+#   persona off                   关闭人格 → 删除 personas/active.md
+#   persona show                  显示当前激活人格
+#
+# 注意：本脚本是 Python 3。请勿用 bash/sh 直接调用（见 kit/cli/task 同款防护）。
+# ====================================================================
+"echo" "✗ 本脚本是 Python 3，请勿用 bash/sh 调用（bash 会把 Python 源码当 shell 逐行解析）。正确用法: ./kit/cli/persona <子命令> 或 python3 kit/cli/persona <子命令>"
+"exit" "1"
+import os
+import sys
+
+# Windows 控制台 GBK 下 print(✓/✗/中文) 会 UnicodeEncodeError；统一强制 UTF-8。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def find_project_root(start):
+    """从脚本位置向上寻找项目根（含 aios.config.yaml 的目录）。"""
+    d = os.path.dirname(os.path.abspath(start))
+    while True:
+        if os.path.isfile(os.path.join(d, "aios.config.yaml")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.dirname(os.path.dirname(os.path.abspath(start)))
+
+
+AI_DIR = find_project_root(__file__)
+# 框架人格库：兼容平铺（<root>/personas）与 kit 子目录（<root>/kit/personas）
+FRAME_PERSONAS = os.path.join(AI_DIR, "kit", "personas") if os.path.isdir(os.path.join(AI_DIR, "kit")) else os.path.join(AI_DIR, "personas")
+# 项目人格库（可写）：项目根 personas/，active.md 也在此
+PROJECT_PERSONAS = os.path.join(AI_DIR, "personas")
+ACTIVE_FILE = os.path.join(PROJECT_PERSONAS, "active.md")
+
+
+def die(msg):
+    print(f"✗ {msg}")
+    sys.exit(1)
+
+
+def find_persona(name):
+    """在框架库与项目库中查找 <name>.md，返回 (path, source)。"""
+    for base, label in ((FRAME_PERSONAS, "框架库"), (PROJECT_PERSONAS, "项目库")):
+        p = os.path.join(base, f"{name}.md")
+        if os.path.isfile(p):
+            return p, label
+    return None, None
+
+
+def read_meta(path):
+    """读取 persona 文件 frontmatter（简单 YAML 键值），返回 dict；无 frontmatter 返回空。"""
+    meta = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            head = f.read(800)
+    except OSError:
+        return meta
+    if not head.startswith("---"):
+        return meta
+    end = head.find("---", 3)
+    if end < 0:
+        return meta
+    for line in head[3:end].splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            meta[k.strip()] = v.strip()
+    return meta
+
+
+# 分类展示顺序（不在表中的归「其他」最后）
+CAT_ORDER = ["帝王将相 · 政坛", "东方古典 · 武侠", "诗人 · 哲人", "国漫", "日漫",
+             "欧美文学 · 影视", "欧美漫画", "游戏", "身份原型"]
+
+
+def cmd_list():
+    print("可用人格：")
+    items = []  # (cat, slug, desc, label)
+    for base, label in ((FRAME_PERSONAS, "框架库"), (PROJECT_PERSONAS, "项目库")):
+        if not os.path.isdir(base):
+            continue
+        for f in sorted(os.listdir(base)):
+            if f.endswith(".md") and f not in ("active.md", "README.md", "INDEX.md") and not f.startswith("_"):
+                meta = read_meta(os.path.join(base, f))
+                name_cn = meta.get("name_cn", "")
+                src = meta.get("src", "")
+                tag = meta.get("tag", "")
+                cat = meta.get("cat", "其他")
+                desc = name_cn
+                if src:
+                    desc += f"（{src}）"
+                if tag:
+                    desc += f" — {tag}"
+                items.append((cat, f[:-3], desc, label))
+    if not items:
+        print("  （空）")
+    else:
+        # 按分类分组展示（顺序：CAT_ORDER，其他最后；组内按 slug 排序）
+        groups = {}
+        for cat, slug, desc, label in items:
+            groups.setdefault(cat, []).append((slug, desc, label))
+        order = {c: i for i, c in enumerate(CAT_ORDER)}
+        for cat in sorted(groups, key=lambda c: (order.get(c, len(order)), c)):
+            print(f"\n【{cat}】")
+            for slug, desc, label in groups[cat]:
+                print(f"  {slug:<20}{desc}")
+    if os.path.isfile(ACTIVE_FILE):
+        print(f"\n当前激活: {os.path.basename(os.readlink(ACTIVE_FILE)) if os.path.islink(ACTIVE_FILE) else '见 personas/active.md'}")
+    else:
+        print("\n当前激活: 无（零加载）")
+
+
+def cmd_use(name):
+    if not name:
+        die("用法: persona use <name>")
+    src, label = find_persona(name)
+    if src is None:
+        die(f"人格不存在: {name}（可用: persona list）")
+    os.makedirs(PROJECT_PERSONAS, exist_ok=True)
+    with open(src, encoding="utf-8") as f:
+        body = f.read().strip()
+    if not body:
+        die(f"人格文件为空: {src}")
+    with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
+        f.write(f"<!-- 当前激活人格: {name}（来源: {label} {src}）。由 `cli/persona use` 生成，勿手编；关闭: `cli/persona off`。 -->\n\n{body}\n")
+    print(f"✓ 已激活人格: {name} → {ACTIVE_FILE}")
+
+
+def cmd_off():
+    if os.path.exists(ACTIVE_FILE) or os.path.islink(ACTIVE_FILE):
+        os.remove(ACTIVE_FILE)
+        print(f"✓ 已关闭人格（零加载）: {ACTIVE_FILE}")
+    else:
+        print("· 当前未激活任何人格")
+
+
+def cmd_show():
+    if os.path.islink(ACTIVE_FILE):
+        print(f"当前激活: {os.readlink(ACTIVE_FILE)}")
+    elif os.path.isfile(ACTIVE_FILE):
+        with open(ACTIVE_FILE, encoding="utf-8") as f:
+            head = f.read(400)
+        print("当前激活: personas/active.md")
+        print("---")
+        print(head)
+    else:
+        print("当前激活: 无（零加载）")
+
+
+USAGE = """persona — 人格切换 CLI（按需加载）
+================================================
+用法:
+  persona list                  列出可用人格（框架库 + 项目库）
+  persona use <name>            激活人格 → 写入 personas/active.md
+  persona off                   关闭人格 → 删除 personas/active.md
+  persona show                  显示当前激活人格
+"""
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd = args[0]
+    if cmd == "list":
+        cmd_list()
+    elif cmd == "use":
+        cmd_use(args[1] if len(args) > 1 else None)
+    elif cmd == "off":
+        cmd_off()
+    elif cmd == "show":
+        cmd_show()
+    else:
+        die(f"未知命令: {cmd}\n{USAGE}")
+
+
+if __name__ == "__main__":
+    main()

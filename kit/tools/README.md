@@ -8,6 +8,7 @@
 
 | 工具 | 能力 | 接口 |
 |------|------|------|
+| `agent/` | AIOS 遥测推送（读被监控项目 runtime/ 状态 → 按间隔推送 ingest，含退避） | `python3 kit/tools/agent/agent.py [--once] [--interval N] [--quiet]`（配置见 `agent.json`） |
 | `git/` | 版本控制（commit/branch/diff/checkpoint） | `git add/commit/push`, `git diff --stat`, `git stash` |
 | `filesystem/` | 文件读写、目录遍历 | read/write/edit/ls |
 | `shell/` | 命令行执行（编译/测试/构建） | bash <command> |
@@ -28,6 +29,9 @@ Agent 角色（Coder）
   └→ AI 工具（pi / Claude Code / Cursor）
        └→ 执行 tools/git/commit
 ```
+
+> 例外：`agent/` 是独立进程能力（不依赖 AI 工具 executor）——mkproject 自动分发到新项目，
+> 部署方式见 [`agent/README.md`](agent/README.md)（systemd / nohup / Task Scheduler）。
 
 ## 如何添加新工具
 

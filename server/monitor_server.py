@@ -18,21 +18,27 @@ monitor_server.py — aimonitor 后端采集服务（零第三方依赖，Python
 """
 import abc
 import argparse
+import fnmatch
 import hmac
 import json
 import math
 import os
+import secrets
 import re
 import sqlite3
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config", "projects.json")
+# projects.json 读写锁（TASK-069）：审批并发写保护——register_project_in_config 的
+# 读-改-写（load → append → os.replace）需要互斥，否则两个并发审批可能互相覆盖丢条目
+PROJECTS_CONFIG_LOCK = threading.Lock()
 STATUSES = ("open", "in-progress", "in-review", "blocked", "done", "cancelled")
 
 # 历史快照存储（TASK-022）：aimonitor 自身 data/，不入被监控项目
@@ -45,6 +51,15 @@ DEFAULT_EVENT_LIMIT = 10
 MAX_EVENT_LIMIT = 100
 
 EVENTS_RE = re.compile(r"^/api/projects/([^/]+)/events$")
+STATUS_RE = re.compile(r"^/api/register/([^/]+)/status$")
+APPROVE_RE = re.compile(r"^/api/register/([^/]+)/approve$")
+REJECT_RE = re.compile(r"^/api/register/([^/]+)/reject$")
+REVOKE_RE = re.compile(r"^/api/register/([^/]+)/revoke$")
+RENEW_RE = re.compile(r"^/api/register/([^/]+)/renew$")
+
+# 注册码管理端点（TASK-057）
+CODES_GENERATE_RE = re.compile(r"^/api/register/codes/generate$")
+CODES_REVOKE_RE = re.compile(r"^/api/register/codes/([^/]+)/revoke$")
 
 # 告警派生（TASK-026，见 MONITOR-SPEC §4.6）：默认阈值与参与 task-stale 判定的非终态状态
 DEFAULT_BLOCKED_RATIO_THRESHOLD = 0.2
@@ -53,10 +68,14 @@ ALERT_STALE_STATUSES = ("open", "in-progress", "in-review", "blocked")
 
 # agent 推送存储（TASK-033/034）：默认库位置与 HistoryStore 同目录 data/ingest.db
 INGEST_DB_REL = ("data", "ingest.db")
+# 注册审批存储（TASK-047）：默认库位置 data/registration.db
+REGISTRATION_DB_REL = ("data", "registration.db")
 # ingest API（TASK-034，见 MONITOR-SPEC §3.1.3）：payload 上限，超限 413
 MAX_INGEST_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5MB（tasks+events 原文体量留足余量）
 # ingest 鉴权（TASK-035，见 MONITOR-SPEC §3.1.2）：config/agents.json（权限 600，gitignored）
 AGENTS_CONFIG_REL = ("config", "agents.json")
+# admin 密码（TASK-049，见 MONITOR-SPEC §3.2.5）：config/admin.json（权限 600，gitignored）
+ADMIN_CONFIG_REL = ("config", "admin.json")
 # ingest 限流（TASK-036，见 MONITOR-SPEC §3.1.3）：每 agent 每分钟 N 次，超限 429；
 # N 由 config/projects.json 顶层 ingest_rate_limit_per_minute 配置（缺省此默认值）
 DEFAULT_INGEST_RATE_LIMIT_PER_MINUTE = 60
@@ -1025,11 +1044,541 @@ class IngestRateLimiter:
                 del self._buckets[k]
 
 
+class RegistrationStore:
+    """注册审批存储层（TASK-047，MONITOR-SPEC §3.2.3）：stdlib sqlite3。
+
+    表 registration_request（data/registration.db）记录注册请求及其状态机转换：
+    - pending \u2192 approved|rejected|expired
+    - approved \u2192 revoked
+    - rejected/expired \u2192 noop（可重新注册）
+
+    连接模式复用 HistoryStore/IngestStore：每次操作独立连接 + WAL 保证读写并发；
+    _connect 内幂等建表（CREATE TABLE IF NOT EXISTS）→ 连接丢失或 db 文件重建后
+    自动重连自愈。默认库位置 data/registration.db（由接入方注入）。
+    """
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._connect().close()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS registration_request ("
+                " req_id TEXT PRIMARY KEY,"
+                " project_id TEXT NOT NULL,"
+                " path TEXT,"
+                " enrollment_code TEXT,"
+                " host_info TEXT NOT NULL,"
+                " request_key TEXT NOT NULL,"
+                " status TEXT NOT NULL DEFAULT 'pending',"
+                " issued_token TEXT,"
+                " token_delivered INTEGER DEFAULT 0,"
+                " reject_reason TEXT,"
+                " created_at REAL NOT NULL,"
+                " decided_at REAL,"
+                " expire_at REAL NOT NULL)"
+            )
+            # 迁移：既有表可能缺少 token_delivered / reject_reason / renew_count / path 列
+            for col in ("token_delivered", "reject_reason", "renew_count", "path"):
+                try:
+                    conn.execute(
+                        "ALTER TABLE registration_request ADD COLUMN {}".format(col))
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
+    def _now(self):
+        return time.time()
+
+    def _expire_at(self):
+        return time.time() + 7 * 86400
+
+    def create(self, project_id, enrollment_code, host_info, request_key, path=None):
+        """创建注册请求；成功返回 req_id，冲突（同 project_id 已有 pending/approved）返回 None。
+
+        path（TASK-069）：申请 payload 的被监控项目路径，审批通过后用于自动登记
+        projects.json；旧记录/旧调用缺省 None（展示与登记时按 project_id 兜底）。
+        每次创建后触发过期清理（expire_stale）。
+        """
+        req_id = uuid.uuid4().hex
+        now = self._now()
+        expire = self._expire_at()
+        with self.lock:
+            conn = self._connect()
+            try:
+                # 冲突检查：同 project_id 有活跃记录（pending 或 approved）
+                existing = conn.execute(
+                    "SELECT status FROM registration_request"
+                    " WHERE project_id=? AND status IN ('pending', 'approved')",
+                    (project_id,),
+                ).fetchone()
+                if existing is not None:
+                    return None
+                with conn:
+                    conn.execute(
+                        "INSERT INTO registration_request"
+                        " (req_id, project_id, path, enrollment_code, host_info, request_key,"
+                        "  status, created_at, expire_at)"
+                        " VALUES (?,?,?,?,?,?, 'pending',?,?)",
+                        (req_id, project_id, path, enrollment_code, host_info,
+                         request_key, now, expire),
+                    )
+            finally:
+                conn.close()
+        # 每次创建后清理过期 pending
+        self.expire_stale()
+        return req_id
+
+    def get(self, req_id):
+        """读取一行；无记录返回 None。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT req_id, project_id, path, enrollment_code, host_info, request_key,"
+                    "       status, issued_token, token_delivered, reject_reason,"
+                    "       created_at, decided_at, expire_at, renew_count"
+                    " FROM registration_request WHERE req_id=?",
+                    (req_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return None
+        return {
+            "req_id": row[0], "project_id": row[1], "path": row[2],
+            "enrollment_code": row[3], "host_info": row[4],
+            "request_key": row[5], "status": row[6],
+            "issued_token": row[7], "token_delivered": bool(row[8]),
+            "reject_reason": row[9], "created_at": row[10],
+            "decided_at": row[11], "expire_at": row[12],
+            "renew_count": row[13] or 0,
+        }
+
+    def list_by_status(self, status=None):
+        """按 status 筛选；无参返回全部（按 created_at 升序）。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                if status:
+                    rows = conn.execute(
+                        "SELECT req_id, project_id, path, enrollment_code, host_info, request_key,"
+                        "       status, issued_token, token_delivered, reject_reason,"
+                        "       created_at, decided_at, expire_at, renew_count"
+                        " FROM registration_request WHERE status=? ORDER BY created_at",
+                        (status,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT req_id, project_id, path, enrollment_code, host_info, request_key,"
+                        "       status, issued_token, token_delivered, reject_reason,"
+                        "       created_at, decided_at, expire_at, renew_count"
+                        " FROM registration_request ORDER BY created_at",
+                    ).fetchall()
+            finally:
+                conn.close()
+        return [{
+            "req_id": r[0], "project_id": r[1], "path": r[2],
+            "enrollment_code": r[3], "host_info": r[4],
+            "request_key": r[5], "status": r[6],
+            "issued_token": r[7], "token_delivered": bool(r[8]),
+            "reject_reason": r[9], "created_at": r[10],
+            "decided_at": r[11], "expire_at": r[12],
+            "renew_count": r[13] or 0,
+        } for r in rows]
+
+    def approve(self, req_id, token):
+        """审批通过：pending → approved。非 pending 状态 → 不操作返回 False。"""
+        now = self._now()
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT status FROM registration_request WHERE req_id=?",
+                    (req_id,),
+                ).fetchone()
+                if row is None or row[0] != "pending":
+                    return False
+                with conn:
+                    conn.execute(
+                        "UPDATE registration_request"
+                        " SET status='approved', issued_token=?, decided_at=?"
+                        " WHERE req_id=?",
+                        (token, now, req_id),
+                    )
+                return True
+            finally:
+                conn.close()
+
+    def reject(self, req_id, reason=None):
+        """拒绝：pending → rejected。非 pending 状态 → 不操作返回 False。
+
+        reason 参数接受拒绝原因字符串，持久化于 reject_reason 列。
+        """
+        now = self._now()
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT status FROM registration_request WHERE req_id=?",
+                    (req_id,),
+                ).fetchone()
+                if row is None or row[0] != "pending":
+                    return False
+                with conn:
+                    conn.execute(
+                        "UPDATE registration_request"
+                        " SET status='rejected', decided_at=?, reject_reason=?"
+                        " WHERE req_id=?",
+                        (now, reason, req_id),
+                    )
+                return True
+            finally:
+                conn.close()
+
+    def revoke(self, req_id):
+        """吊销：approved → revoked。非 approved 状态 → 不操作返回 False。"""
+        now = self._now()
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT status FROM registration_request WHERE req_id=?",
+                    (req_id,),
+                ).fetchone()
+                if row is None or row[0] != "approved":
+                    return False
+                with conn:
+                    conn.execute(
+                        "UPDATE registration_request"
+                        " SET status='revoked', decided_at=?"
+                        " WHERE req_id=?",
+                        (now, req_id),
+                    )
+                return True
+            finally:
+                conn.close()
+
+    def renew(self, req_id, token):
+        """轮换：approved → 保持 approved，更新 issued_token/decided_at/token_delivered/renew_count。
+
+        状态守卫（REVIEW F1）：仅当 status='approved' 且 renew_count=0 时更新（返回 True），
+        否则返回 False。守卫在 store 锁内执行，避免并发 revoke/并发双 renew 破坏状态机：
+        并发 revoke 先提交后，renew 不会在 revoked 记录上写入新 token；
+        并发双 renew 只有一个成功（rowcount=1），另一个返回 False。
+        """
+        now = self._now()
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    cur = conn.execute(
+                        "UPDATE registration_request"
+                        " SET issued_token=?, decided_at=?, token_delivered=0,"
+                        "     renew_count=COALESCE(renew_count,0)+1"
+                        " WHERE req_id=? AND status='approved'"
+                        "   AND COALESCE(renew_count,0)=0",
+                        (token, now, req_id),
+                    )
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+
+    def mark_token_delivered(self, req_id):
+        """标记 token_delivered=1（TASK-051：单次交付后不再返回 token）。
+
+        req_id 不存在时无操作（不抛异常）。
+        """
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE registration_request"
+                        " SET token_delivered=1"
+                        " WHERE req_id=?",
+                        (req_id,),
+                    )
+            finally:
+                conn.close()
+
+    def expire_stale(self):
+        """将 expire_at < now 的 pending 记录置为 expired（保留记录，不删除）。"""
+        now = self._now()
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE registration_request"
+                        " SET status='expired', decided_at=?"
+                        " WHERE status='pending' AND expire_at<?",
+                        (now, now),
+                    )
+            finally:
+                conn.close()
+
+
+class EnrollmentCodeStore:
+    """注册码存储层（TASK-048，MONITOR-SPEC §3.2.4）：stdlib sqlite3。
+
+    表 enrollment_code（data/registration.db，与 RegistrationStore 同一 DB）
+    支持注册码的生成、校验、消费、吊销。
+
+    连接模式复用 RegistrationStore/IngestStore：每次操作独立连接 + WAL 保证读写并发；
+    _connect 内幂等建表（CREATE TABLE IF NOT EXISTS）→ 连接丢失或 db 文件重建后
+    自动重连自愈。默认库位置 data/registration.db（由接入方注入）。
+    """
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._connect().close()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS enrollment_code ("
+                " code TEXT PRIMARY KEY,"
+                " description TEXT,"
+                " allowed_project_pattern TEXT,"
+                " max_uses INTEGER DEFAULT 1,"
+                " use_count INTEGER DEFAULT 0,"
+                " created_at REAL NOT NULL,"
+                " expire_at REAL,"
+                " revoked INTEGER DEFAULT 0)"
+            )
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
+    def _now(self):
+        return time.time()
+
+    def generate(self, description=None, allowed_project_pattern=None,
+                 max_uses=1, expire_at=None):
+        """生成随机注册码并写入数据库；返回 code 字符串。
+
+        code 由 secrets.token_urlsafe(16) 生成，格式化为 XXXXXXXX-XXXXXXXX
+        （16 字节随机，可读性强）。
+        """
+        raw = secrets.token_urlsafe(16)  # 22 chars base64 url-safe
+        # 置换 - 和 _ 为字母数字，确保输出格式为 XXXXXXXX-XXXXXXXX（可读性强）
+        clean = raw.replace("-", "A").replace("_", "B")[:16]
+        code = clean[:8] + "-" + clean[8:16]
+        now = self._now()
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    conn.execute(
+                        "INSERT INTO enrollment_code"
+                        " (code, description, allowed_project_pattern, max_uses,"
+                        "  use_count, created_at, expire_at, revoked)"
+                        " VALUES (?,?,?,?,0,?,?,0)",
+                        (code, description, allowed_project_pattern, max_uses,
+                         now, expire_at),
+                    )
+            finally:
+                conn.close()
+        return code
+
+    def list(self):
+        """返回所有注册码（按 created_at 升序）。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT code, description, allowed_project_pattern, max_uses,"
+                    "       use_count, created_at, expire_at, revoked"
+                    " FROM enrollment_code ORDER BY created_at",
+                ).fetchall()
+            finally:
+                conn.close()
+        return [{
+            "code": r[0], "description": r[1],
+            "allowed_project_pattern": r[2], "max_uses": r[3],
+            "use_count": r[4], "created_at": r[5],
+            "expire_at": r[6], "revoked": bool(r[7]),
+        } for r in rows]
+
+    def get(self, code):
+        """读取一行；无记录返回 None。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT code, description, allowed_project_pattern, max_uses,"
+                    "       use_count, created_at, expire_at, revoked"
+                    " FROM enrollment_code WHERE code=?",
+                    (code,),
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return None
+        return {
+            "code": row[0], "description": row[1],
+            "allowed_project_pattern": row[2], "max_uses": row[3],
+            "use_count": row[4], "created_at": row[5],
+            "expire_at": row[6], "revoked": bool(row[7]),
+        }
+
+    def validate(self, code, project_id):
+        """校验注册码是否可用于指定 project_id。
+
+        全部通过 → True；任一条件不满足 → False：
+        - code 存在
+        - 未吊销（revoked=0）
+        - 未过期（expire_at IS NULL 或 expire_at > now）
+        - 使用次数未超限（use_count < max_uses）
+        - project_id 匹配 allowed_project_pattern（非空时 glob 匹配；为空则不校验）
+        """
+        row = self.get(code)
+        if row is None:
+            return False
+        if row["revoked"]:
+            return False
+        if row["expire_at"] is not None and row["expire_at"] < self._now():
+            return False
+        if row["use_count"] >= row["max_uses"]:
+            return False
+        pat = row["allowed_project_pattern"]
+        if pat:
+            if not fnmatch.fnmatch(project_id, pat):
+                return False
+        return True
+
+    def consume(self, code):
+        """消费一次注册码：use_count +1。
+
+        超过 max_uses 后 consume 不报错（由 validate 拦截消费前校验）。
+        code 不存在时无操作（不抛异常）。
+        """
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE enrollment_code SET use_count=use_count+1"
+                        " WHERE code=?",
+                        (code,),
+                    )
+            finally:
+                conn.close()
+
+    def revoke(self, code):
+        """吊销注册码（标记 revoked=1）。code 不存在时无操作（不抛异常）。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE enrollment_code SET revoked=1 WHERE code=?",
+                        (code,),
+                    )
+            finally:
+                conn.close()
+
+
+def read_agents_config(agents_path=None):
+    """读取 config/agents.json → dict（TASK-054，TASK-052 依赖）。
+
+    文件不存在/格式错误/顶层非对象 → {}（fail-closed，与 load_agents_config 不同：
+    后者额外检查权限 600，用于 TASK-035 鉴权；本函数只做简单读取，供 TokenIssuer 内部使用）。
+    """
+    path = agents_path or os.path.join(ROOT, *AGENTS_CONFIG_REL)
+    try:
+        if not os.path.isfile(path):
+            return {}
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_agents_config(config, agents_path=None):
+    """写入 config/agents.json（600）；原子写入：先写临时文件再 rename。
+
+    config 为 {project_id: token} 结构的 dict。
+    """
+    path = agents_path or os.path.join(ROOT, *AGENTS_CONFIG_REL)
+    dirname = os.path.dirname(path)
+    os.makedirs(dirname, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass  # Windows 或无权限 FS 不阻塞
+    os.replace(tmp, path)
+
+
+def remove_token(project_id, agents_path=None):
+    """从 config/agents.json 中移除指定 project_id 的 token。
+
+    项目不存在时不操作（不抛异常）。
+    """
+    config = read_agents_config(agents_path)
+    if project_id in config:
+        del config[project_id]
+        write_agents_config(config, agents_path)
+
+
+class TokenIssuer:
+    """Token 签发服务（TASK-054，TASK-052 依赖）。
+
+    生成 bearer token、写入 config/agents.json（600）。
+    Token 格式：aimon_{project_id}_{uuid4}_{token_urlsafe(32)}
+    实现细节（与规格示例字面略有差异，功能合规）：
+      - uuid4 部分为 uuid4().hex，即 32 位十六进制、无连字符；
+      - 后缀为 secrets.token_urlsafe(32)，base64url 字符集（含 -/_，非纯 hex）。
+    写入格式：{ project_id: token }（兼容现有 load_agents_config/resolve_agent_id）。
+    安全：secrets.token_urlsafe 生成、写入后 chmod 600、不入日志；
+    原子写入：先写临时文件再 rename，避免写入中断导致文件损坏。
+    """
+
+    def __init__(self, agents_path=None):
+        self.agents_path = agents_path or os.path.join(ROOT, *AGENTS_CONFIG_REL)
+
+    def issue(self, project_id):
+        """签发 token → { token, project_id, scope }。
+
+        scope 固定为 "agent"（当前只支持 agent 角色）。
+        token 不入日志（调用方保证不 print/log）。
+        """
+        token = (f"aimon_{project_id}_"
+                 f"{uuid.uuid4().hex}_"
+                 f"{secrets.token_urlsafe(32)}")
+        config = read_agents_config(self.agents_path)
+        config[project_id] = token
+        write_agents_config(config, self.agents_path)
+        return {"token": token, "project_id": project_id, "scope": "agent"}
+
+    def remove(self, project_id):
+        """移除指定 project_id 的 token。"""
+        remove_token(project_id, self.agents_path)
+
+
 class State:
     """聚合缓存 + 后台轮询线程（daemon）。"""
 
     def __init__(self, config, quiet=False, db_path=None, ingest_db_path=None, agents_path=None,
-                 rate_clock=None):
+                 rate_clock=None, registration_db_path=None, projects_path=None):
         self.config = config
         self.quiet = quiet
         self.lock = threading.Lock()
@@ -1045,6 +1594,7 @@ class State:
         self.ingest = IngestStore(ingest_db_path)
         # agent token 配置（TASK-035）：config/agents.json（权限 600，gitignored），测试可注入临时路径
         agents_path = agents_path or os.path.join(ROOT, *AGENTS_CONFIG_REL)
+        self.agents_path = agents_path
         self.agents = load_agents_config(agents_path)
         if not self.agents:
             self._log(f"⚠ {os.path.relpath(agents_path, ROOT)} 缺失或不可用 → "
@@ -1053,6 +1603,19 @@ class State:
         # rate_clock 仅供测试注入确定性时钟，生产用 time.time
         self.rate_limiter = IngestRateLimiter(
             config.get("ingest_rate_limit_per_minute", DEFAULT_INGEST_RATE_LIMIT_PER_MINUTE),
+            clock=rate_clock or time.time,
+        )
+        # 注册存储（TASK-047）：默认 <ROOT>/data/registration.db，测试可注入临时路径
+        registration_db_path = registration_db_path or os.path.join(ROOT, *REGISTRATION_DB_REL)
+        self.registration = RegistrationStore(registration_db_path)
+        # 项目注册表路径（TASK-069）：审批通过自动登记 projects.json 的目标文件；
+        # 缺省 config/projects.json，测试可注入临时路径避免污染真实配置
+        self.projects_path = projects_path or CONFIG_PATH
+        # 注册码存储（TASK-048）：与 RegistrationStore 同一 DB
+        self.enrollment = EnrollmentCodeStore(registration_db_path)
+        # 注册端点限流（TASK-050）：全局限流，config.projects.json 顶层可配置
+        self.register_limiter = IngestRateLimiter(
+            config.get("register_rate_limit_per_minute", 60),
             clock=rate_clock or time.time,
         )
         self._start_poller()
@@ -1266,6 +1829,127 @@ def load_agents_config(path=None):
     return data
 
 
+def ensure_admin_config(path=None):
+    """首次启动时若 config/admin.json 不存在，自动生成并写入（TASK-049，§3.2.5）。
+
+    生成 32 字符随机密码（secrets.token_hex(16)），文件权限 600，stdout 打印一次。
+    已存在时不覆盖（幂等）。
+    """
+    path = path or os.path.join(ROOT, *ADMIN_CONFIG_REL)
+    if os.path.isfile(path):
+        return
+    password = secrets.token_hex(16)  # 32 字符十六进制
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"admin_password": password}, fh, ensure_ascii=False)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # Windows 或无权限 FS 不阻塞
+    print(f"Admin password: {password}", flush=True)
+
+
+def load_admin_config(path=None):
+    """加载 config/admin.json → 密码字符串；不可用 → None（fail-closed）。
+
+    fail-closed 语义：
+    - 文件缺失 → None
+    - 权限过宽（非 600）→ None + 告警
+    - JSON 非法 / 顶层非对象 / 缺 admin_password 字段 → None + 告警
+    """
+    path = path or os.path.join(ROOT, *ADMIN_CONFIG_REL)
+    if not os.path.isfile(path):
+        return None
+    try:
+        if os.stat(path).st_mode & 0o077:
+            print(f"\u26a0 {path} 权限不是 600（group/other 可读），拒绝加载 admin 密码（fail-closed）",
+                  file=sys.stderr)
+            return None
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        print(f"\u26a0 读取 {path} 失败（{e}），拒绝加载 admin 密码（fail-closed）", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        print(f"\u26a0 {path} 顶层必须是 JSON 对象，拒绝加载 admin 密码（fail-closed）", file=sys.stderr)
+        return None
+    pw = data.get("admin_password")
+    if not isinstance(pw, str) or not pw:
+        print(f"\u26a0 {path} 缺少 admin_password 字段或非字符串，拒绝加载 admin 密码（fail-closed）",
+              file=sys.stderr)
+        return None
+    return pw
+
+
+def load_projects_config(path=None):
+    """读取 config/projects.json → dict（TASK-069）。
+
+    fail-open 语义（区别于 agents/admin 的 fail-closed）：本函数服务于"审批通过自动
+    登记"，文件缺失/损坏时返回最小默认结构，不阻断审批；文件在服务启动时已由 main()
+    校验，此处异常多为运维瞬时状态。
+    默认结构：{"poll_interval_seconds": 30, "projects": []}
+    """
+    path = path or CONFIG_PATH
+    default = {"poll_interval_seconds": 30, "projects": []}
+    if not os.path.isfile(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        print(f"\u26a0 读取 {path} 失败（{e}），按默认结构处理", file=sys.stderr)
+        return default
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        print(f"\u26a0 {path} 结构异常（顶层非对象或 projects 非列表），按默认结构处理",
+              file=sys.stderr)
+        return default
+    return data
+
+
+def register_project_in_config(path, project_id, name=None, path_value=None, transport="agent"):
+    """审批通过后把 project_id 自动登记进 config/projects.json（TASK-069）。
+
+    幂等：project_id 已存在 → 不重复追加，返回 None。
+    成功新登记 → 返回新条目 dict（调用方用于同步内存 config）。
+    原子写：先写 <path>.tmp 再 os.replace（进程崩溃不产生半截文件）。
+    并发：模块级 PROJECTS_CONFIG_LOCK 互斥读-改-写，防并发审批丢失条目。
+    """
+    with PROJECTS_CONFIG_LOCK:
+        data = load_projects_config(path)
+        projects = data.setdefault("projects", [])
+        for p in projects:
+            if isinstance(p, dict) and p.get("id") == project_id:
+                return None
+        entry = {
+            "id": project_id,
+            "name": name or project_id,
+            "path": path_value or project_id,
+            "transport": transport,
+        }
+        projects.append(entry)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+        return entry
+
+
+def check_admin_password(req):
+    """校验请求的 Authorization: Bearer 是否匹配 config/admin.json 密码（TASK-049）。
+
+    参数 req 为 BaseHTTPRequestHandler 实例（含 .headers 和 .command）。
+    返回 True/False。fail-closed：配置文件缺失/损坏/权限错误 → 全部返回 False。
+    """
+    token = extract_bearer_token(req.headers.get("Authorization", ""))
+    if token is None:
+        return False
+    pw = load_admin_config()
+    if pw is None:
+        return False
+    return hmac.compare_digest(token.encode("utf-8"), pw.encode("utf-8"))
+
+
 def extract_bearer_token(authorization):
     """解析 Authorization 头 → Bearer token；缺失/格式错/空 token → None。"""
     if not authorization:
@@ -1375,7 +2059,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         m = EVENTS_RE.match(path)
         if m:
             self._events(m.group(1), query)
-        elif path == "/api/status":
+            return
+        m = STATUS_RE.match(path)
+        if m:
+            self._register_status(m.group(1), query)
+            return
+        if path == "/api/register/codes":
+            self._enrollment_codes_list(query)
+            return
+        if path == "/api/register/list":
+            self._register_list(query)
+            return
+        if path == "/api/status":
             self._json(self._status_payload(query))
         elif path == "/api/history":
             self._history(query)
@@ -1383,15 +2078,47 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._static()
 
     def do_POST(self):
-        """POST /api/ingest（TASK-034/035/036，MONITOR-SPEC §3.1.3）：鉴权 → 限流 → 解析 → 授权 → 落库。
+        """POST /api/ingest（TASK-034/035/036，MONITOR-SPEC §3.1.3）或 POST /api/register（TASK-050，§3.2.6）。
 
+        /api/ingest：鉴权 → 限流 → 解析 → 授权 → 落库。
         顺序：先鉴权（401）再限流（429）再读体——未认证请求不消耗解析资源，也不泄露任何数据；
         授权范围（403）/ 未注册（400）/ 同 id 双 agent（409）由 _ingest 内检查。
         错误：401（无/错 token）/ 429（限流超限）/ 400（schema 错 / project_id 未注册）/
         403（project_id 不在授权范围）/ 409（同 id 已被另一 agent 占用）/ 413（payload 超限）/
         404（非 ingest 路径）/ 500（落库失败）。
+
+        /api/register：公开端点，全局限流 → 校验 → 冲突检测 → 写入。
+        错误：400（schema 错）/ 409（project_id 已存在）/ 429（限流超限）。
         """
-        if self.path.split("?", 1)[0] != "/api/ingest":
+        path = self.path.split("?", 1)[0]
+        m = APPROVE_RE.match(path)
+        if m:
+            self._approve(m.group(1))
+            return
+        m = REJECT_RE.match(path)
+        if m:
+            self._reject(m.group(1))
+            return
+        m = REVOKE_RE.match(path)
+        if m:
+            self._revoke(m.group(1))
+            return
+        m = RENEW_RE.match(path)
+        if m:
+            self._renew(m.group(1))
+            return
+        m = CODES_GENERATE_RE.match(path)
+        if m:
+            self._enrollment_codes_generate()
+            return
+        m = CODES_REVOKE_RE.match(path)
+        if m:
+            self._enrollment_code_revoke(m.group(1))
+            return
+        if path == "/api/register":
+            self._register()
+            return
+        if path != "/api/ingest":
             self._json_error(404, "未找到端点")
             return
         token = extract_bearer_token(self.headers.get("Authorization", ""))
@@ -1514,13 +2241,570 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json_error(self, status, message):
-        body = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
+    def _json_error(self, status, message, extra=None):
+        """发送 JSON 错误响应；extra 为额外键值对（如 existing 字段）。"""
+        obj = {"error": message}
+        if extra:
+            obj.update(extra)
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _register(self):
+        """POST /api/register（TASK-050，MONITOR-SPEC §3.2.6）：全局限流 → 校验 → 冲突检测 → 写入。
+
+        公开端点，无 token 鉴权。
+        错误：400（schema 错）/ 409（project_id 已存在）/ 429（限流超限）。
+        """
+        # 1. 全局限流（60 次/分钟，可配置）
+        if not ApiHandler.state.register_limiter.allow("__global__"):
+            self._json_error(429, "rate limit")
+            return
+
+        # 2. 读取请求体
+        data, err = self._read_body()
+        if err:
+            self._json_error(413, err)
+            return
+
+        # 3. 解析 JSON
+        try:
+            obj = json.loads(data)
+        except (UnicodeDecodeError, ValueError):
+            self._json_error(400, "请求体不是合法 JSON")
+            return
+        if not isinstance(obj, dict):
+            self._json_error(400, "请求体必须为 JSON 对象")
+            return
+
+        # 4. Schema 校验
+        project_id = obj.get("project_id")
+        if not isinstance(project_id, str) or not project_id.strip():
+            self._json_error(400, "project_id 必须为非空字符串")
+            return
+        if not re.match(r"^[a-zA-Z0-9-]+$", project_id):
+            self._json_error(400, "project_id 只能包含字母、数字和连字符")
+            return
+
+        path = obj.get("path")
+        if not isinstance(path, str) or not path.strip():
+            self._json_error(400, "path 必须为非空字符串")
+            return
+
+        host_info = obj.get("host_info")
+        if not isinstance(host_info, str) or not host_info.strip():
+            self._json_error(400, "host_info 必须为非空字符串")
+            return
+
+        request_key = obj.get("request_key")
+        if not isinstance(request_key, str) or not request_key.strip():
+            self._json_error(400, "request_key 必须为非空字符串")
+            return
+        if len(request_key.encode("utf-8")) < 16:
+            self._json_error(400, "request_key 长度不能少于 16 字节")
+            return
+
+        enrollment_code = obj.get("enrollment_code")
+        if enrollment_code is not None and not isinstance(enrollment_code, str):
+            self._json_error(400, "enrollment_code 必须为字符串")
+            return
+
+        # 5. 冲突检测
+        # project_id 在 config/projects.json 已存在 → 409 active
+        if is_project_registered(ApiHandler.state.config, project_id):
+            self._json_error(409, "project_id 已存在", extra={"existing": "active"})
+            return
+
+        # project_id 在 ingest_state 有活跃记录 → 409 active
+        ingest_row = ApiHandler.state.ingest.read(project_id)
+        if ingest_row is not None:
+            self._json_error(409, "project_id 已存在", extra={"existing": "active"})
+            return
+
+        # 同 project_id 已有 pending 申请 → 409 pending
+        pending = ApiHandler.state.registration.list_by_status("pending")
+        for p in pending:
+            if p["project_id"] == project_id:
+                self._json_error(409, "project_id 已存在", extra={"existing": "pending"})
+                return
+
+        # 同 project_id 只有 rejected/expired 记录 → 允许注册（不冲突）
+
+        # 6. 注册码校验
+        code_valid = False
+        if enrollment_code:
+            if ApiHandler.state.enrollment.validate(enrollment_code, project_id):
+                code_valid = True
+            else:
+                self._json_error(400, "invalid enrollment_code")
+                return
+
+        # 7. 写入 RegistrationStore（path 一并存储，TASK-069）
+        req_id = ApiHandler.state.registration.create(
+            project_id, enrollment_code, host_info, request_key, path=path)
+        if req_id is None:
+            # 竞争条件：两次请求之间插入了 pending
+            self._json_error(409, "project_id 已存在", extra={"existing": "pending"})
+            return
+
+        # 8. 消费注册码
+        if code_valid and enrollment_code:
+            ApiHandler.state.enrollment.consume(enrollment_code)
+
+        # 9. 返回 201
+        row = ApiHandler.state.registration.get(req_id)
+        body = json.dumps({
+            "req_id": req_id,
+            "status": "pending",
+            "pending_since": row["created_at"],
+        }, ensure_ascii=False).encode("utf-8")
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _register_list(self, query):
+        """GET /api/register/list?status=pending（TASK-055）：返回注册申请列表。
+
+        Admin-authenticated 端点（check_admin_password）。
+        按 status 筛选（缺省返回全部），按 created_at 升序。
+        错误：401/auth。
+        """
+        # 1. 鉴权
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+
+        # 2. 解析 status 参数
+        params = parse_qs(query)
+        status = (params.get("status") or [None])[0]
+
+        # 3. 查询注册列表
+        rows = ApiHandler.state.registration.list_by_status(status)
+
+        # 4. 返回 JSON 数组
+        self._json(rows)
+
+    def _register_status(self, req_id, query):
+        """GET /api/register/:req_id/status（TASK-051，MONITOR-SPEC §3.2.7）：agent 轮询审批结果。
+
+        公开端点，无 token 鉴权。
+        - request_key 不匹配 → 404（不区分'req_id 不存在'和'key 错误'）
+        - 缺少 request_key 参数 → 404
+        - 各状态返回不同响应体（验收标准 STATUS-002）
+        - Token 单次交付：首次返回 approved 时含 token，标记 token_delivered=1，后续不再返回
+        - 不涉及限流（agent 轮询频率低，30s 一次）
+        """
+        params = parse_qs(query)
+        request_key = (params.get("request_key") or [None])[0]
+        if not request_key:
+            self._json_error(404, "not found")
+            return
+
+        row = ApiHandler.state.registration.get(req_id)
+        if row is None:
+            self._json_error(404, "not found")
+            return
+
+        # request_key 绑定校验：不匹配 → 404（不泄露 req_id 是否存在）
+        if not hmac.compare_digest(row["request_key"].encode("utf-8"),
+                                     request_key.encode("utf-8")):
+            self._json_error(404, "not found")
+            return
+
+        status = row["status"]
+
+        if status == "pending":
+            self._json({"status": "pending", "pending_since": row["created_at"]})
+        elif status == "approved":
+            if row["token_delivered"]:
+                # 已交付 → 不再返回 token
+                self._json({"status": "approved"})
+            else:
+                # 首次交付 → 标记 delivered，返回 token + project_id
+                ApiHandler.state.registration.mark_token_delivered(req_id)
+                self._json({
+                    "status": "approved",
+                    "token": row["issued_token"],
+                    "project_id": row["project_id"],
+                })
+        elif status == "rejected":
+            self._json({"status": "rejected", "reason": row.get("reject_reason") or ""})
+        elif status == "expired":
+            self._json({"status": "expired"})
+        elif status == "revoked":
+            self._json({"status": "revoked"})
+        else:
+            self._json_error(404, "not found")
+
+    def _approve(self, req_id):
+        """POST /api/register/:req_id/approve（TASK-052，MONITOR-SPEC §3.2.8）。
+
+        Admin-authenticated 端点（check_admin_password）。
+        错误：401/auth、404/req_id 不存在、409/已处理、500/agents.json 写入失败。
+        """
+        # 1. 鉴权
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+
+        # 2. 读取注册记录
+        row = ApiHandler.state.registration.get(req_id)
+        if row is None:
+            self._json_error(404, "not found")
+            return
+
+        # 3. 幂等/状态检查
+        if row["status"] != "pending":
+            self._json_error(409, "already processed")
+            return
+
+        # 4. 签发 token
+        try:
+            issuer = TokenIssuer(agents_path=ApiHandler.state.agents_path)
+            result = issuer.issue(row["project_id"])
+        except OSError as e:
+            print(f"[{datetime.now().strftime('%F %T')}] agents.json 写入失败: {e}",
+                  file=sys.stderr)
+            self._json_error(500, "internal error")
+            return
+
+        # 5. 更新 RegistrationStore（pending → approved）
+        token = result["token"]
+        if not ApiHandler.state.registration.approve(req_id, token):
+            # 竞争条件：理论上不会发生（步骤 3 已检查 status），但防御。
+            # 步骤 4 已把 token 写入 agents.json，此处回滚避免 orphan token
+            # （可通过 /api/ingest 鉴权而注册请求未 approved）。
+            try:
+                issuer.remove(row["project_id"])
+            except OSError as e:
+                print(f"[{datetime.now().strftime('%F %T')}] agents.json 回滚失败: {e}",
+                      file=sys.stderr)
+            self._json_error(409, "already processed")
+            return
+
+        # 6. 消费注册码（如存在）；失败不阻断审批，但记录告警
+        if row.get("enrollment_code"):
+            try:
+                ApiHandler.state.enrollment.consume(row["enrollment_code"])
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%F %T')}] "
+                      f"enrollment_code 消费失败: {e}", file=sys.stderr)
+
+        # 7. 刷新 agents 缓存
+        ApiHandler.state.agents = load_agents_config(ApiHandler.state.agents_path)
+
+        # 7.5 自动登记 project_id 到 config/projects.json（TASK-069）：审批通过即把
+        # 申请登记为 agent 项目（transport=agent, path=申请 path），修复审批后 agent
+        # 推送 400 "project_id 未注册"。幂等（已存在不重复追加）。
+        # 失败不阻断审批（best-effort，与 enrollment_code 消费失败语义一致），仅告警——
+        # token 已签发且 agents.json 已写，回滚会引入不一致。
+        try:
+            entry = register_project_in_config(
+                ApiHandler.state.projects_path,
+                row["project_id"],
+                name=row["project_id"],
+                path_value=row.get("path"),
+                transport="agent",
+            )
+            if entry is not None:
+                projects = ApiHandler.state.config.setdefault("projects", [])
+                if not any(p.get("id") == row["project_id"] for p in projects):
+                    projects.append(entry)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%F %T')}] "
+                  f"projects.json 自动登记失败: {e}", file=sys.stderr)
+
+        # 8. 返回 200
+        self._json({
+            "status": "approved",
+            "req_id": req_id,
+            "project_id": row["project_id"],
+        })
+
+    def _reject(self, req_id):
+        """POST /api/register/:req_id/reject（TASK-052，MONITOR-SPEC §3.2.8）。
+
+        Admin-authenticated 端点（check_admin_password）。
+        请求体 JSON（可选）：{ "reason": "拒绝原因" } —— 持久化于 reject_reason 列
+        （TASK-056 F2 修复：MONITOR-SPEC §3.2.8 已声明请求体，此前被丢弃）。
+        错误：401/auth、404/req_id 不存在、409/已处理。
+        """
+        # 1. 鉴权
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+
+        # 2. 读取注册记录
+        row = ApiHandler.state.registration.get(req_id)
+        if row is None:
+            self._json_error(404, "not found")
+            return
+
+        # 3. 幂等/状态检查
+        if row["status"] != "pending":
+            self._json_error(409, "already processed")
+            return
+
+        # 4. 读取可选拒绝原因（MONITOR-SPEC §3.2.8：{ "reason": "拒绝原因" }）
+        reason = None
+        body = self._read_body_json()
+        if body is not None:
+            r = body.get("reason")
+            if isinstance(r, str) and r.strip():
+                reason = r.strip()
+
+        # 5. 更新 RegistrationStore（pending → rejected）
+        # 未提供原因时使用 None（区别于空串）
+        if not ApiHandler.state.registration.reject(req_id, reason=reason):
+            self._json_error(409, "already processed")
+            return
+
+        # 6. 返回 200
+        self._json({
+            "status": "rejected",
+            "req_id": req_id,
+        })
+
+    def _revoke(self, req_id):
+        """POST /api/register/:req_id/revoke（TASK-053，MONITOR-SPEC §3.2.8）。
+
+        Admin-authenticated 端点（check_admin_password）。
+        错误：401/auth、404/req_id 不存在、409/已处理（非 approved 状态）。
+        """
+        # 1. 鉴权
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+
+        # 2. 读取注册记录
+        row = ApiHandler.state.registration.get(req_id)
+        if row is None:
+            self._json_error(404, "not found")
+            return
+
+        # 3. 状态检查：必须是 approved 状态
+        if row["status"] != "approved":
+            self._json_error(409, "already processed")
+            return
+
+        # 4. 从 agents.json 中移除 token
+        try:
+            issuer = TokenIssuer(agents_path=ApiHandler.state.agents_path)
+            issuer.remove(row["project_id"])
+        except OSError as e:
+            print(f"[{datetime.now().strftime('%F %T')}] agents.json 写入失败: {e}",
+                  file=sys.stderr)
+            self._json_error(500, "internal error")
+            return
+
+        # 5. 更新 RegistrationStore（approved → revoked）
+        if not ApiHandler.state.registration.revoke(req_id):
+            # 竞争条件：理论上不会发生（步骤 3 已检查 status），但防御
+            self._json_error(409, "already processed")
+            return
+
+        # 6. 刷新 agents 缓存
+        ApiHandler.state.agents = load_agents_config(ApiHandler.state.agents_path)
+
+        # 7. 返回 200
+        self._json({
+            "status": "revoked",
+        })
+
+    def _renew(self, req_id):
+        """POST /api/register/:req_id/renew（TASK-053，MONITOR-SPEC §3.2.6）。
+
+        Admin-authenticated 端点（check_admin_password）。
+        执行 revoke 逻辑（移除旧 token）+ 签发新 token。
+        错误：401/auth、404/req_id 不存在、409/已处理（非 approved 状态/已 renew）。
+        部分失败窗口（REVIEW F2，可重试自愈）：步骤 5 remove 成功后步骤 6 issue 失败 → 500，
+        renew_count 未递增、旧 token 已删，agent 重试 renew 会重签；
+        步骤 7 store 守卫失败 → 409（并发 revoke 或并发 renew），按需回滚本请求刚签发的 token。
+        """
+        # 1. 鉴权
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+
+        # 2. 读取注册记录
+        row = ApiHandler.state.registration.get(req_id)
+        if row is None:
+            self._json_error(404, "not found")
+            return
+
+        # 3. 状态检查：必须是 approved 状态
+        if row["status"] != "approved":
+            self._json_error(409, "already processed")
+            return
+
+        # 4. 重复 renew 检测
+        if row.get("renew_count", 0) > 0:
+            self._json_error(409, "already processed")
+            return
+
+        # 5. 从 agents.json 中移除旧 token
+        try:
+            issuer = TokenIssuer(agents_path=ApiHandler.state.agents_path)
+            issuer.remove(row["project_id"])
+        except OSError as e:
+            print(f"[{datetime.now().strftime('%F %T')}] agents.json 写入失败: {e}",
+                  file=sys.stderr)
+            self._json_error(500, "internal error")
+            return
+
+        # 6. 签发新 token
+        try:
+            result = issuer.issue(row["project_id"])
+        except OSError as e:
+            print(f"[{datetime.now().strftime('%F %T')}] agents.json 写入失败: {e}",
+                  file=sys.stderr)
+            self._json_error(500, "internal error")
+            return
+
+        # 7. 更新 RegistrationStore：保持 status='approved'，更新 issued_token/decided_at/
+        #    token_delivered=0（供 agent 通过 status 端点领取新 token），renew_count+1。
+        #    守卫在 store 锁内（status='approved' AND renew_count=0），并发安全
+        #    （REVIEW F1：并发 revoke/双 renew 不得在非 approved 记录上写新 token）。
+        if not ApiHandler.state.registration.renew(req_id, result["token"]):
+            # 并发竞争：守卫失败（并发 revoke 已提交，或并发 renew 已提交）。
+            # 仅当 agents.json 中仍是本请求刚签发的 token 时回滚——并发 revoke 场景下
+            # 避免 revoked 记录残留 live token（REVIEW F1）；并发双 renew 场景下保留
+            # 胜出方 token，不误删。
+            try:
+                current = read_agents_config(ApiHandler.state.agents_path)
+                if current.get(row["project_id"]) == result["token"]:
+                    issuer.remove(row["project_id"])
+            except OSError as e:
+                print(f"[{datetime.now().strftime('%F %T')}] agents.json 回滚失败: {e}",
+                      file=sys.stderr)
+            self._json_error(409, "already processed")
+            return
+
+        # 8. 刷新 agents 缓存
+        ApiHandler.state.agents = load_agents_config(ApiHandler.state.agents_path)
+
+        # 9. 返回 200
+        self._json({
+            "status": "approved",
+            "note": "新 token 已签发，agent 下次推送时收到 401 后自动轮询领取",
+        })
+
+    # ===== TASK-057: 注册码管理端点 =====
+
+    def _enrollment_codes_list(self, query):
+        """GET /api/register/codes（TASK-057）：返回所有注册码列表。
+
+        Admin-authenticated 端点（check_admin_password）。
+        按 created_at 升序，返回 EnrollmentCodeStore.list() 全部字段。
+        错误：401/auth。
+        """
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+        codes = ApiHandler.state.enrollment.list()
+        self._json(codes)
+
+    def _enrollment_codes_generate(self):
+        """POST /api/register/codes/generate（TASK-057）：生成注册码。
+
+        Admin-authenticated 端点（check_admin_password）。
+        请求体 JSON：
+          - description（必填，字符串）
+          - allowed_project（可选，glob 字符串）
+          - max_uses（可选，整数，默认 1）
+          - expire_at（可选，timestamp 浮点数，过期时间）
+        返回：{code, description, allowed_project_pattern, max_uses, expire_at, created_at}
+        错误：401/auth、400/参数校验。
+        """
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+
+        body = self._read_body_json()
+        if body is None:
+            self._json_error(400, "请求体必须为 JSON")
+            return
+
+        description = body.get("description")
+        if not description or not isinstance(description, str) or not description.strip():
+            self._json_error(400, "description 为必填字符串")
+            return
+
+        allowed_project = body.get("allowed_project")
+        if allowed_project is not None and not isinstance(allowed_project, str):
+            self._json_error(400, "allowed_project 必须为字符串")
+            return
+
+        max_uses = body.get("max_uses", 1)
+        # F5（REVIEW）：Python bool 是 int 子类，isinstance(True, int) 为 True；
+        # 先排除布尔，避免 {"max_uses": true} 被当作 1 接受
+        if isinstance(max_uses, bool) or not isinstance(max_uses, int) or max_uses < 1:
+            self._json_error(400, "max_uses 必须为 >=1 的整数")
+            return
+
+        expire_at = body.get("expire_at")
+        # F5（REVIEW）：同样排除布尔（{"expire_at": true} 不应通过）
+        if expire_at is not None and (isinstance(expire_at, bool) or not isinstance(expire_at, (int, float))):
+            self._json_error(400, "expire_at 必须为数字（timestamp）")
+            return
+
+        code = ApiHandler.state.enrollment.generate(
+            description=description.strip(),
+            allowed_project_pattern=allowed_project.strip() if allowed_project else None,
+            max_uses=max_uses,
+            expire_at=expire_at,
+        )
+
+        # F6（REVIEW）：created_at 取 store 记录值，与库内时间一致
+        # （generate() 内部写入的 now 与响应侧 time.time() 有毫秒级差异）
+        created_at = None
+        row = ApiHandler.state.enrollment.get(code)
+        if row is not None:
+            created_at = row.get("created_at")
+        if created_at is None:
+            created_at = time.time()
+
+        self._json({
+            "code": code,
+            "description": description.strip(),
+            "allowed_project_pattern": allowed_project.strip() if allowed_project else None,
+            "max_uses": max_uses,
+            "expire_at": expire_at,
+            "created_at": created_at,
+        })
+
+    def _enrollment_code_revoke(self, code):
+        """POST /api/register/codes/:code/revoke（TASK-057）：吊销注册码。
+
+        Admin-authenticated 端点（check_admin_password）。
+        错误：401/auth。
+        幂等：重复吊销不报错（EnrollmentCodeStore.revoke 对不存在 code 无操作）。
+        """
+        if not check_admin_password(self):
+            self._json_error(401, "unauthorized")
+            return
+
+        ApiHandler.state.enrollment.revoke(code)
+        self._json({"status": "revoked", "code": code})
+
+    def _read_body_json(self):
+        """读取请求体并解析为 JSON；失败返回 None。"""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            length = 0
+        if length <= 0:
+            return None
+        try:
+            raw = self.rfile.read(length)
+            return json.loads(raw)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
 
     def _history(self, query):
         """GET /api/history?project=<id>&hours=<n>（TASK-022，见 MONITOR-SPEC §4.2）。"""
@@ -1638,6 +2922,7 @@ def main():
         print(f"✗ 读取 {CONFIG_PATH} 失败: {e}", file=sys.stderr)
         sys.exit(1)
 
+    ensure_admin_config()
     ApiHandler.state = State(config, quiet=args.quiet)
     ApiHandler.static_dir = os.path.join(ROOT, "src" if args.dev else "dist")
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), ApiHandler)

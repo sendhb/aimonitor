@@ -1,0 +1,9 @@
+{
+  "server_url": "https://aimonitor.example.com/api/ingest",
+  "token": "<your-ingest-token>",
+  "projects": [
+    {"id": "my-project", "path": "/absolute/path/to/my-project"}
+  ],
+  "poll_interval_seconds": 30,
+  "state": "active"
+}

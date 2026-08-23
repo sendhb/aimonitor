@@ -1,0 +1,10 @@
+---
+description: 对话人格指路 — 按需加载见 personas/active.md
+globs: **/*
+---
+# 对话人格（按需加载 · 表达层设定）
+
+当前激活人格见项目根 `personas/active.md`（未激活则零加载）。
+切换: `kit/cli/persona list | use <name> | off | show`。
+
+本文件为薄壳指路，不复制内容，避免双源漂移。

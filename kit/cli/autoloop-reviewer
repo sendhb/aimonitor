@@ -3,13 +3,13 @@
 # autoloop-reviewer — 无人值守 Reviewer 循环（可选/实验性）
 #
 # 定时轮询 runtime/tasks/，捡 in-review 且 assignee ≠ 自己的任务，用一个
-# 独立的无头 Claude Code 会话按 kit/agents/reviewer/role.md 审查，写 REVIEW
-# 记录，通过则 approve，需要返工则打回 in-progress。
+# 独立的无头 LLM 会话（默认 pi，--llm 可覆盖）按 kit/agents/reviewer/role.md
+# 审查，写 REVIEW 记录，通过则 approve，需要返工则打回 in-progress。
 #
 # 与 autoloop-coder 是两个完全独立的进程，只通过 runtime/tasks/ 文件状态
 # 耦合 —— 对应 kit/agents/reviewer/role.md 的“生成者 ≠ 审查者，必须不同会话/
-# 工具”要求：这里用两个独立的 claude -p 进程/会话满足该约束，而不是同一
-# 会话里切换角色。
+# 工具”要求：这里用两个独立的 LLM 进程/会话满足该约束，而不是同一会话里
+# 切换角色。
 #
 # ⚠️ 危险操作：--unattended 会给 claude -p 传 --dangerously-skip-permissions，
 # 仅在隔离环境中启用。P0 任务若 approval-ref 未填，approve 会被 cli/task
@@ -18,8 +18,11 @@
 # 用法:
 #   cli/autoloop-reviewer [--interval SEC] [--once] [--unattended] [--id NAME] [--timeout SEC] [--llm claude|deepseek|pi]
 #
-# --llm 选择 LLM provider（默认 claude；也支持 deepseek[via codewhale] 和 pi）。
+# --llm 选择 LLM provider（默认 pi，TASK-012；也支持 claude[仅 Linux 环境] 和 deepseek[via codewhale]）。
 #       也可用环境变量 AIOS_LLM 设置。
+#
+# 进程锁：TASK-012 起不再依赖 util-linux flock（Git Bash/MSYS 原生可跑），
+# 用纯 Python 跨平台锁（lib/lock.py，Windows: msvcrt.locking / POSIX: fcntl.flock）。
 #
 # 心跳/事件产出（给 harness 监控系统读）:
 #   runtime/logs/autoloop-reviewer.heartbeat        每轮循环开始时间戳（判断循环是否卡死）
@@ -39,8 +42,12 @@ ONCE=0
 UNATTENDED=0
 TIMEOUT=1800
 AGENT_ID="${AUTOLOOP_REVIEWER_ID:-autoloop-reviewer}"
-LLM="${AIOS_LLM:-claude}"  # claude | deepseek | pi（TASK-009）
+LLM="${AIOS_LLM:-pi}"  # claude | deepseek | pi（TASK-009；TASK-012 默认 pi）
 
+# TASK-017：解析前保存原始参数副本。参数解析用 shift 消费 $@，之后
+# lock_guard 重入（exec 回本脚本）需要原样透传 --once/--llm 等参数；
+# 若直接传 $@ 此时已为空 → 重入后丢失 --once 误走常驻分支。
+ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --interval) INTERVAL="$2"; shift 2 ;;
@@ -61,30 +68,39 @@ NAME="reviewer"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/heartbeat.sh"
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 
-# —— 进程级防重入锁（TASK-008）——
+# —— 进程级防重入锁（TASK-008/TASK-012）——
 # 无论是否经 kit/cli/autoloop 启动器，直接执行本脚本也持有同一把锁：
 # 同一角色（reviewer）同时只允许一个进程，堵住绕过启动器入口的并发竞态
 # （两个 reviewer 并发 pick 同一 in-review 任务 → 重复 REVIEW/重复 approve）。
+# 纯 Python 跨平台锁（Git Bash 无需 flock）：拿不到锁 → 提示并退出；
+# 拿到锁 → exec 重入本脚本（AIOS_LOCK_HELD=1），锁随运行期自动释放。
+# shellcheck source=lib/lock_guard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/lock_guard.sh"
 LOCK_FILE="$ROOT/runtime/locks/autoloop-reviewer.lock"
 mkdir -p "$(dirname "$LOCK_FILE")"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  log "✗ 已有 autoloop-reviewer 实例在运行（$LOCK_FILE）——拒绝启动（TASK-008 进程级锁）"
-  exit 1
-fi
-# 锁随 fd 9 持有至本进程退出（子 LLM 会话继承期间仍持有），常驻/单轮均自动释放
+lock_guard "$LOCK_FILE" "${ORIG_ARGS[@]}"
 
 field() { grep -m1 "^[[:space:]]*$2:" "$1" | awk '{print $2}'; }
 
 # 选第一个 in-review 且 assignee ≠ 自己的任务（按任务编号升序）
 pick_task() {
-  local f status assignee
+  local f status assignee risk priority reviewer
   for f in $(ls "$ROOT"/runtime/tasks/TASK-*.md 2>/dev/null | sort); do
     status="$(field "$f" status)"
     [ "$status" = "in-review" ] || continue
     assignee="$(field "$f" assignee)"
     if [ -n "$assignee" ] && [ "$assignee" = "$AGENT_ID" ]; then
       continue   # 生成者 ≠ 审查者：跳过自己实现的任务
+    fi
+    # fast-path 防御性跳过（与 task-policy 分级治理一致，TASK-047/048）：
+    # risk/priority 均非 P0/P1 且 reviewer 未指定 → fast-path，正常不会进入 in-review（coder 直接 done）
+    risk="$(field "$f" risk)"
+    priority="$(field "$f" priority)"
+    reviewer="$(field "$f" reviewer)"
+    if [ "$risk" != "P0" ] && [ "$risk" != "P1" ] && [ "$priority" != "P0" ] && [ "$priority" != "P1" ] \
+       && { [ -z "$reviewer" ] || [ "$reviewer" = "any" ]; }; then
+      log "⏭ $(basename "$f" .md) 是 fast-path（risk/priority 非 P0/P1 且未指定 reviewer），跳过审查"
+      continue
     fi
     basename "$f" .md | grep -o '^TASK-[0-9]\{3\}'
     return 0
@@ -103,27 +119,39 @@ run_once() {
   task_file=$(ls "$ROOT"/runtime/tasks/"$task_id"-*.md | head -1)
 
   log "▶ 开始审查 $task_id"
-  local prompt
-  prompt="你现在扮演 Reviewer 角色（kit/agents/reviewer/role.md）。任务：$task_id（见 runtime/tasks/$(basename "$task_file")）。
+  local risk priority reviewer_depth prompt
+  risk="$(field "$task_file" risk)"
+  priority="$(field "$task_file" priority)"
+  if [ "$risk" = "P0" ] || [ "$risk" = "P1" ] || [ "$priority" = "P0" ] || [ "$priority" = "P1" ]; then
+    reviewer_depth="六维（P0/P1）"
+  else
+    reviewer_depth="三问（P2）"
+  fi
+  prompt="你现在扮演 Reviewer 角色。任务：$task_id（见 runtime/tasks/$(basename "$task_file")）。
+先读 kit/cli/autoloop-boot.md（速查）与 kit/runtime/reviews/REVIEW.template.md（分级模板）。
 你不是这个任务的实现者，本次是独立会话审查，禁止修改被审查的代码（审查 ≠ 修复）。
-按 kit/agents/reviewer/role.md 的检查维度（架构/安全/影响/质量/测试/合规）审查 diff，
+按任务 risk 分级审查（$reviewer_depth）：
+- P2 三问：验收标准是否满足？改动是否越界？verify 是否真实通过？（不自由审计）
+- P0/P1 六维：SDD 合规/架构/安全/影响/质量/测试。
+发现只写真实问题，禁止样板发现；无问题写\"无\"。
 写 runtime/reviews/REVIEW-<date>-<scope>.md（reviewer 字段填 $AGENT_ID，implementation-author 填任务的 assignee，result 填 pass 或 issues-found/critical）。
-- 通过 → 执行: ./kit/cli/task approve $task_id
-- 需要返工 → 在 REVIEW 记录写明问题，执行: ./kit/cli/task start $task_id 打回给 Coder
-- 若 approve 因 P0 缺少 approval-ref 被拒绝，执行: ./kit/cli/task block $task_id \"P0 需人工批准\" 然后停止，不要重试或绕过
-注意：task 是 Python 3 脚本，必须用 ./kit/cli/task 或 python3 kit/cli/task 调用，**不要用 bash kit/cli/task**（bash 会把 Python 源码当 shell 逐行解析，产生巨量输出并死循环，脚本已自带防护）。"
+- 通过 → 执行: python kit/cli/task approve $task_id
+- 需要返工 → 在 REVIEW 记录写明问题，执行: python kit/cli/task start $task_id 打回给 Coder（自动计 rework；2→3 被拒则 task block）
+- 若 approve 因 P0 缺少 approval-ref 被拒绝，执行: python kit/cli/task block $task_id \"P0 需人工批准\" 然后停止，不要重试或绕过
+注意：task 是 Python 3 脚本，用 python kit/cli/task 调用（Windows 无 python3；Linux 也可用 ./kit/cli/task 或 python3），**不要用 bash kit/cli/task**（巨量输出死循环，脚本已自带防护）。"
 
   local rc=0
+  # TASK-012：-k 30 兜底——Windows 上 pi/node 忽略 SIGTERM，无 -k 则挂死会话永不结束
   if [ "$LLM" = "deepseek" ]; then
     # deepseek：OpenAI 兼容 API（cli/lib/llm.sh，key 读自 pi 配置，不打印）
-    timeout "$TIMEOUT" bash "$(dirname "${BASH_SOURCE[0]}")/lib/llm.sh" deepseek "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
+    timeout -k 30 "$TIMEOUT" bash "$(dirname "${BASH_SOURCE[0]}")/lib/llm.sh" deepseek "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
   elif [ "$LLM" = "pi" ]; then
     # pi coding agent（TASK-009）：非交互模式 --no-session
-    timeout "$TIMEOUT" bash "$(dirname "${BASH_SOURCE[0]}")/lib/llm.sh" pi "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
+    timeout -k 30 "$TIMEOUT" bash "$(dirname "${BASH_SOURCE[0]}")/lib/llm.sh" pi "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
   elif [ "$UNATTENDED" = "1" ]; then
-    timeout "$TIMEOUT" claude -p "$prompt" --dangerously-skip-permissions >>"$LOG_FILE" 2>&1 || rc=$?
+    timeout -k 30 "$TIMEOUT" claude -p "$prompt" --dangerously-skip-permissions >>"$LOG_FILE" 2>&1 || rc=$?
   else
-    timeout "$TIMEOUT" claude -p "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
+    timeout -k 30 "$TIMEOUT" claude -p "$prompt" >>"$LOG_FILE" 2>&1 || rc=$?
   fi
   if [ "$rc" -eq 124 ]; then
     log "✗ $task_id 会话超时（>${TIMEOUT}s），已 kill（见 $LOG_FILE）"

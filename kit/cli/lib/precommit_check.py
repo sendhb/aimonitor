@@ -14,9 +14,19 @@ import config as cfg_lib  # noqa: E402
 
 
 def main():
+    # Windows GBK 控制台下，▶/⚠/✗ 等 Unicode 字符无法编码会直接抛
+    # UnicodeEncodeError 导致 pre-commit hook 拒绝提交。统一重配为
+    # UTF-8 + replace（Linux UTF-8 locale 下 reconfigure 无副作用）。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     root = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         capture_output=True, text=True, check=True,
+        encoding="utf-8", errors="replace",
     ).stdout.strip()
 
     try:
@@ -28,6 +38,7 @@ def main():
     staged = subprocess.run(
         ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
         cwd=root, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
     ).stdout.splitlines()
 
     gen_dirs = [d.rstrip("/") for d in cfg["generated_dirs"]]
