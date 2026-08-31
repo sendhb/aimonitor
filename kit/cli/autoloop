@@ -238,6 +238,11 @@ case "$MODE" in
         if [ "$a" = "--foreground" ]; then FOREGROUND=1; fi
       done
       RE_ARGS=(both "${KEEP[@]}" --interval "$INTERVAL")
+      # TASK-079: parse_role_llm 已把 --coder-llm/--reviewer-llm 剥到 CODER_LLM/
+      # REVIEWER_LLM，必须显式加回 RE_ARGS，否则后台化/前台重入后 per-role LLM
+      # 丢失回落到默认 --llm ${AIOS_LLM:-pi}。
+      if [ -n "$CODER_LLM" ]; then RE_ARGS+=(--coder-llm "$CODER_LLM"); fi
+      if [ -n "$REVIEWER_LLM" ]; then RE_ARGS+=(--reviewer-llm "$REVIEWER_LLM"); fi
       if [ "$FOREGROUND" = "1" ]; then
         # 前台：原地 exec → python 持锁 → bash 重入本脚本跑循环（Ctrl-C 停止）
         AIOS_LOCK_HELD=1 exec "$PY" "$LOCKPY" hold "$BOTH_LOCK" -- bash "$0" "${RE_ARGS[@]}"

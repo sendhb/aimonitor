@@ -169,6 +169,71 @@ schtasks /Create /TN "AIOS Agent" /SC ONSTART /RU SYSTEM ^
 容量上限：tasks/events/heartbeats 各 ≤ 50 条；单条 content/focus ≤ 4096 字符
 （超长截尾 + `…[truncated]` 标记）；整体 ≤ 256 KiB（超出抛 `PayloadTooLargeError`，本轮跳过推送）。
 
+### 事件流（TASK-066/071，outbox 语义 + 服务端消费契约）
+
+> 目标：把“只有快照”升级为“事件 + 游标”，为中央可重建视图/增量同步打地基。
+> 事件由 `cli/task` 每次状态流转追加到项目本地 `runtime/logs/task-events.jsonl`（append-only，含单调递增 `seq`）；
+> agent 按 outbox 语义增量推送到 aimonitor（TASK-066 传输，TASK-071 服务端消费）。
+
+payload 可选携带事件增量（**启用后新增顶层键，快照字段不变，向后兼容**）：
+
+```json
+{
+  "project_id": "proj-1",
+  "ts": 1786892400.0,
+  "cursor": 12,
+  "events": [
+    {"seq": 13, "ts": "2026-08-27T09:00:00", "ev": "task.started",
+     "task": "TASK-012", "from": "open", "to": "in-progress",
+     "actor": "cli/task", "commit": "abc1234", "dispatch_ref": null, "reason": null}
+  ],
+  "files": { "tasks": [...], "focus": "...", "heartbeats": [...], "events": [...], "verification_count": 3, "review_count": 1 }
+}
+```
+
+**payload 字段契约**：
+
+| 字段 | 类型 | 语义 |
+|------|------|------|
+| `events` | `array[object] \| null` | 本轮**新增**（`seq > cursor`）的 task 事件，按 seq 递增；≤ 200 条/批。缺失 = 未启用事件流（旧 payload）；空数组 = 已启用但本轮无新事件 |
+| `cursor` | `int \| null` | 本轮推送**确认覆盖**到的最大 seq（只增不减）；`null` 仅在无事件且从未推送时出现 |
+| `events[].seq` | `int` | 单调递增正整数（≥1）；批内严格递增（后一条 > 前一条） |
+| `events[].ts` | `string` | 事件发生时间（ISO 8601 本地时间，`YYYY-MM-DDTHH:MM:SS`） |
+| `events[].ev` | `string` | 事件类型：`task.created` / `task.started` / `task.verified` / `task.review_requested` / `task.approved` / `task.done` / `task.blocked` / `task.unblocked` / `task.cancelled` |
+| `events[].task` | `string` | 任务短 id（`TASK-012`） |
+| `events[].from` / `to` | `string \| null` | 状态迁移前后（新建事件 `to=open`、`from=null`；verify 事件 from=to=当前态） |
+| `events[].actor` | `string` | 触发方（`cli/task` / agent id） |
+| `events[].commit` | `string \| null` | 触发时的 git commit（短哈希） |
+| `events[].dispatch_ref` / `reason` | `string \| null` | 调度引用 / 原因（可选） |
+
+**seq 规则（写入端 TASK-065 `task validate` 与服务端 TASK-071 ingest 同规则）**：
+- seq 必须是**整数**且 **≥ 1**（拒绝负 seq/0）；
+- 同批内 seq **严格单调递增**（`seq ≤ 上一条` 即拒绝）；
+- 服务端按 `(project_id, seq)` 主键**幂等去重**：游标写失败后的重推/旧批重放不报错、不重复计数。
+
+**cursor 语义（双向）**：
+- 本地游标持久化在 `runtime/logs/.push-cursor`（`{"seq": N}`，gitignored）：**推送成功后才推进**；失败不推进（下次重推，服务端去重幂等）。
+- 从未推送（无游标）→ 全量；事件文件被截断/重建导致游标大于文件最大 seq → 全量重推，不静默丢。
+- 事件文件缺失 → payload 不含 `events`/`cursor` 键（未启用事件流的旧行为）。
+- 服务端校验：`cursor` 为整数 ≥ 0，且不得小于批内最大 seq（`cursor < max(events[].seq)` → 400）；
+  单批 > 200 条 → 400（fail loud，不静默截断）。
+
+**服务端消费（aimonitor，TASK-071）**：
+- ingest 校验通过后，task 事件按 `(project_id, seq)` 存入 `task_events` 表，`cursor` 记入
+  `ingest_state.task_cursor`（只推进不倒退）；事件落库失败 → ingest 500（不静默丢弃）。
+- 查询展示：`GET /api/projects/<id>/events?limit=n` 响应新增
+  `task_events: {count, cursor, events}`——总条数、已确认最大 seq、最近 n 条按 seq 降序
+  （每条含完整事件字段）；`counts`/`events`（role 事件）保持既有形状不变。
+- 旧 payload（无 `events`/`cursor` 键）仍 200：`files` 快照照常落库，task 事件表不写入。
+
+**组件职责**：`cli/task` 写事件（TASK-065）→ `agent_runtime.read_task_events/read_push_cursor/write_push_cursor`
+读写 → `agent_loop._incremental_events` 增量筛选 + 游标推进 → aimonitor ingest/查询（TASK-071）。
+
+**已知限制**：
+- 人为删除/重建 `task-events.jsonl` 会使 seq 重新从 1 开始，与旧流冲突时服务端去重可能丢事件；此时需人工删除 `.push-cursor` 并确认服务端重建（异常运维操作）。
+- 事件文件 append-only 且**无自动归档/压实**：长期运行文件线性增长，agent 每轮全量读取（O(n)）。后续任务可在确认（cursor 已过）后对旧记录截断/归档。
+- 单批 ≤ 200 条由游标联动保证不丢（`_incremental_events` 先截批再推游标）：积压尾部分批推送，不静默丢事件。
+
 ### 状态码（ingest 返回）
 
 | 状态码 | agent 行为 | 可重试 |

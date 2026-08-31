@@ -33,6 +33,8 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
+from urllib.request import Request, urlopen
+import urllib.error
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config", "projects.json")
@@ -60,6 +62,9 @@ RENEW_RE = re.compile(r"^/api/register/([^/]+)/renew$")
 # 注册码管理端点（TASK-057）
 CODES_GENERATE_RE = re.compile(r"^/api/register/codes/generate$")
 CODES_REVOKE_RE = re.compile(r"^/api/register/codes/([^/]+)/revoke$")
+# 下行指令队列（TASK-035，AGENT-DOWNLINK-CONTRACT）
+DOWNLINK_RESULT_RE = re.compile(r"^/api/downlink/commands/(\d+)/result$")
+DOWNLINK_STATUS_RE = re.compile(r"^/api/downlink/commands/(\d+)$")
 
 # 告警派生（TASK-026，见 MONITOR-SPEC §4.6）：默认阈值与参与 task-stale 判定的非终态状态
 DEFAULT_BLOCKED_RATIO_THRESHOLD = 0.2
@@ -68,14 +73,33 @@ ALERT_STALE_STATUSES = ("open", "in-progress", "in-review", "blocked")
 
 # agent 推送存储（TASK-033/034）：默认库位置与 HistoryStore 同目录 data/ingest.db
 INGEST_DB_REL = ("data", "ingest.db")
+DOWNLINK_DB_REL = ("data", "downlink.db")
+# 下行指令（TASK-035，AGENT-DOWNLINK-CONTRACT §二/§三）：白名单/超时/重投上限/tail 截断
+ALLOWED_DOWNLINK_COMMANDS = frozenset({"task_start", "autoloop_coder", "autoloop_reviewer"})
+DOWNLINK_PICKUP_TIMEOUT_DEFAULT = 90   # > 2×poll_interval(30s)：未拾取即 stale
+DOWNLINK_MAX_REQUEUE = 2               # 重投 ≤2 次后 failed(human)
+DOWNLINK_TAIL_MAX_LINES = 200
+DOWNLINK_TERMINAL_STATUSES = ("done", "failed", "skipped")
 # 注册审批存储（TASK-047）：默认库位置 data/registration.db
 REGISTRATION_DB_REL = ("data", "registration.db")
 # ingest API（TASK-034，见 MONITOR-SPEC §3.1.3）：payload 上限，超限 413
 MAX_INGEST_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5MB（tasks+events 原文体量留足余量）
+# task 事件流（TASK-071，aimonitor 服务端消费）：agent 推送的 task-events.jsonl 增量
+# （TASK-066 payload 顶层 events/cursor）。单批上限与 aibase
+# kit/tools/agent/agent_payload.py 的 MAX_TASK_EVENTS=200 对齐；cursor 为已确认推进点。
+MAX_TASK_EVENTS_INGEST = 200
+TASK_EVENTS_TABLE = "task_events"
 # ingest 鉴权（TASK-035，见 MONITOR-SPEC §3.1.2）：config/agents.json（权限 600，gitignored）
 AGENTS_CONFIG_REL = ("config", "agents.json")
 # admin 密码（TASK-049，见 MONITOR-SPEC §3.2.5）：config/admin.json（权限 600，gitignored）
 ADMIN_CONFIG_REL = ("config", "admin.json")
+# 告警通知渠道（TASK-072，见 MONITOR-SPEC §4.7）：config/notify.json（权限 600，gitignored）
+# 或环境变量 AIMONITOR_NOTIFY_WEBHOOK_URL / AIMONITOR_NOTIFY_WEBHOOK_TOKEN。
+# 机密不进 commit（security-policy）：文件缺失/未配置 → 通知禁用（fail-open，不影响轮询）。
+NOTIFY_CONFIG_REL = ("config", "notify.json")
+NOTIFY_ENV_URL = "AIMONITOR_NOTIFY_WEBHOOK_URL"
+NOTIFY_ENV_TOKEN = "AIMONITOR_NOTIFY_WEBHOOK_TOKEN"
+DEFAULT_NOTIFY_TIMEOUT_SECONDS = 5
 # ingest 限流（TASK-036，见 MONITOR-SPEC §3.1.3）：每 agent 每分钟 N 次，超限 429；
 # N 由 config/projects.json 顶层 ingest_rate_limit_per_minute 配置（缺省此默认值）
 DEFAULT_INGEST_RATE_LIMIT_PER_MINUTE = 60
@@ -702,6 +726,85 @@ def derive_project_alerts(p, config=None):
     return alerts
 
 
+def load_notify_config(path=None):
+    """加载告警通知渠道配置（TASK-072，见 MONITOR-SPEC §4.7）→ dict。
+
+    优先级：环境变量（AIMONITOR_NOTIFY_WEBHOOK_URL/_TOKEN）> config/notify.json
+    （权限 600，gitignored）。未配置 / 文件缺失 / JSON 非法 / URL 非 http(s) →
+    返回 {}（通知禁用）。fail-open：通知是增强能力，配置错误绝不拖垮轮询。
+
+    返回结构：{"webhook": {"url": "...", "token": "..."}}（token 可缺省）。
+    """
+    cfg = {}
+    path = path or os.path.join(ROOT, *NOTIFY_CONFIG_REL)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            cfg = data
+    except OSError:
+        pass  # 文件缺失 = 未配置（fail-open）
+    except json.JSONDecodeError:
+        pass  # 非法 JSON = 按未配置处理（fail-open）
+    webhook = cfg.get("webhook") if isinstance(cfg.get("webhook"), dict) else {}
+    env_url = (os.environ.get(NOTIFY_ENV_URL) or "").strip()
+    env_token = (os.environ.get(NOTIFY_ENV_TOKEN) or "").strip()
+    url = env_url or (webhook.get("url") or "").strip()
+    token = env_token or (webhook.get("token") or "").strip()
+    if webhook.get("enabled") is False and not env_url:
+        return {}
+    if not url:
+        return {}
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return {}
+    return {"webhook": {"url": url, "token": token}}
+
+
+class NotificationSender:
+    """告警通知投递（TASK-072，见 MONITOR-SPEC §4.7）：webhook POST（零第三方依赖）。
+
+    - urllib.request POST JSON；token 走 Authorization: Bearer（与 ingest 同风格）；
+      无 token 的 webhook 同样支持
+    - 超时防卡死；任何失败返回 (False, 原因) 不抛异常——通知失败绝不拖垮轮询循环
+    - 幂等/防抖由调用方（State._notify_alerts）按告警指纹控制
+    """
+
+    def __init__(self, webhook_url, token=None, timeout=DEFAULT_NOTIFY_TIMEOUT_SECONDS):
+        self.webhook_url = webhook_url
+        self.token = token
+        self.timeout = timeout
+
+    @property
+    def enabled(self):
+        return bool(self.webhook_url)
+
+    def send(self, items, generated_at=None):
+        """投递一批告警条目 → (ok, detail)。未配置/空 items → 不投递。"""
+        if not self.enabled:
+            return False, "通知未配置"
+        if not items:
+            return False, "无告警条目"
+        payload = {
+            "event": "alerts.changed",
+            "ts": generated_at or time.time(),
+            "count": len(items),
+            "items": items,
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        req = Request(self.webhook_url, data=data, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                return True, f"HTTP {code}"
+        except urllib.error.HTTPError as e:
+            return False, f"HTTP {e.code}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+
 def empty_project(proj):
     return {
         "id": proj["id"],
@@ -891,15 +994,23 @@ class HistoryStore:
 class IngestStore:
     """agent 推送存储层（TASK-033，见 MONITOR-SPEC §3.1.3/§3.1.4）：stdlib sqlite3。
 
-    表 ingest_state(project_id PK, payload_json, last_seen, agent_id)：
+    表 ingest_state(project_id PK, payload_json, last_seen, agent_id, task_cursor)：
     - project_id 主键：同 id 重复推送 INSERT OR REPLACE 覆盖写（幂等，§3.1.3）
     - payload_json 为 §3.1.3 请求体 files 的原始 JSON（解析留待采集层 TASK-038）
     - last_seen 为最近成功推送时间（epoch 秒），agent 整体离线判定依据（§3.1.4）
     - agent_id 记录最近推送者，TASK-036 同 id 双 agent 冲突判定（409）依据
+    - task_cursor（TASK-071，可空）为 task 事件流已确认覆盖的最大 seq；
+      仅推进不倒退（重放/乱序到达取 max），供查询接口作 cursor 确认展示。
+
+    表 task_events(project_id, seq, event_json)（TASK-071）：
+    - (project_id, seq) 复合主键：同批重放/游标写失败后重推 → INSERT OR IGNORE
+      幂等去重（§3.1.3 幂等语义，agent README「服务端按 (project_id, seq) 去重」）
+    - event_json 为单条 task 事件原文（含 seq/ts/ev/task/from/to/actor/...）
 
     连接模式复用 HistoryStore（TASK-022）：每次操作独立连接 + WAL 保证读写并发；
-    _connect 内幂等建表（CREATE TABLE IF NOT EXISTS）→ 连接丢失或 db 文件重建后
-    自动重连自愈。默认库位置与 HistoryStore 同目录 data/ingest.db（由接入方注入）。
+    _connect 内幂等建表（CREATE TABLE IF NOT EXISTS + 既有库 ALTER 迁移）→ 连接丢失
+    或 db 文件重建后自动重连自愈。默认库位置与 HistoryStore 同目录 data/ingest.db
+    （由接入方注入）。
     """
 
     def __init__(self, db_path):
@@ -917,7 +1028,19 @@ class IngestStore:
                 " project_id TEXT PRIMARY KEY,"
                 " payload_json TEXT NOT NULL,"
                 " last_seen INTEGER NOT NULL,"
-                " agent_id TEXT NOT NULL)"
+                " agent_id TEXT NOT NULL,"
+                " task_cursor INTEGER)"
+            )
+            # 既有库迁移（TASK-071）：老库没有 task_cursor 列 → ALTER 补列
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(ingest_state)").fetchall()}
+            if "task_cursor" not in cols:
+                conn.execute("ALTER TABLE ingest_state ADD COLUMN task_cursor INTEGER")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS " + TASK_EVENTS_TABLE + " ("
+                " project_id TEXT NOT NULL,"
+                " seq INTEGER NOT NULL,"
+                " event_json TEXT NOT NULL,"
+                " PRIMARY KEY (project_id, seq))"
             )
         except Exception:
             conn.close()
@@ -928,6 +1051,9 @@ class IngestStore:
         """覆盖写一行 ingest_state（幂等）；返回写入的 last_seen（epoch 秒）。
 
         payload 为 §3.1.3 请求体的 files 对象（dict）；序列化 JSON 存 payload_json。
+        用 `INSERT ... ON CONFLICT DO UPDATE` 而非 `INSERT OR REPLACE`（TASK-071 FIND-002）：
+        DO UPDATE 列清单**不含 task_cursor** → 事件流启用后混入旧 payload（无 events/cursor）
+        推送不会把已确认的 task_cursor 清空（「只推进不倒退」不变量，见 store_task_events）。
         """
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         last_seen = int(time.time())
@@ -936,9 +1062,13 @@ class IngestStore:
             try:
                 with conn:
                     conn.execute(
-                        "INSERT OR REPLACE INTO ingest_state"
+                        "INSERT INTO ingest_state"
                         " (project_id, payload_json, last_seen, agent_id)"
-                        " VALUES (?,?,?,?)",
+                        " VALUES (?,?,?,?)"
+                        " ON CONFLICT(project_id) DO UPDATE SET"
+                        " payload_json=excluded.payload_json,"
+                        " last_seen=excluded.last_seen,"
+                        " agent_id=excluded.agent_id",
                         (project_id, payload_json, last_seen, agent_id),
                     )
             finally:
@@ -954,6 +1084,9 @@ class IngestStore:
         - 既有行 owner != agent_id → 不写入，返回 owner（后到者拒绝 → 409，防互相覆盖污染）
         查询与写入在同一连接同一事务 + self.lock 内完成（单进程 ThreadingHTTPServer 内线程安全），
         事务失败自动回滚；两 agent 并发抢同一 id 只有一个成功。
+        用 `INSERT ... ON CONFLICT DO UPDATE` 而非 `INSERT OR REPLACE`（TASK-071 FIND-002）：
+        DO UPDATE 列清单**不含 task_cursor** → 同 agent 旧 payload 重推不会把已确认的
+        task_cursor 清空（「只推进不倒退」不变量，见 store_task_events）。
         """
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         last_seen = int(time.time())
@@ -968,22 +1101,104 @@ class IngestStore:
                     if row is not None and row[0] != agent_id:
                         return ("conflict", row[0])
                     conn.execute(
-                        "INSERT OR REPLACE INTO ingest_state"
+                        "INSERT INTO ingest_state"
                         " (project_id, payload_json, last_seen, agent_id)"
-                        " VALUES (?,?,?,?)",
+                        " VALUES (?,?,?,?)"
+                        " ON CONFLICT(project_id) DO UPDATE SET"
+                        " payload_json=excluded.payload_json,"
+                        " last_seen=excluded.last_seen,"
+                        " agent_id=excluded.agent_id",
                         (project_id, payload_json, last_seen, agent_id),
                     )
             finally:
                 conn.close()
         return ("ok", last_seen)
 
-    def read(self, project_id):
-        """读取一行 → {project_id, payload, last_seen, agent_id}；无记录 → None。"""
+    def store_task_events(self, project_id, events, cursor=None):
+        """入库 task 事件增量（TASK-071）+ 推进 cursor（仅前进，幂等去重）。
+
+        events 为 payload 顶层 events（list[dict]，validate_ingest_payload 已校验
+        seq 为正整数且批内单调）；cursor 为 payload 顶层 cursor（int|None）。
+        - 事件按 (project_id, seq) INSERT OR IGNORE：重放/重推不报错、不覆盖已有行。
+        - cursor 只取 max(既有, 新值)：乱序到达/旧批重放不会把已确认推进点倒退。
+        - 与 claim_or_update 同一 self.lock 串行化。
+        - **超限即抛 ValueError（TASK-071 FIND-003 fail loud）**：超过 MAX_TASK_EVENTS_INGEST
+          条不允许静默截断再推进 cursor（截断 = 事件永久丢失 + cursor 虚高）；HTTP 层在
+          validate_ingest_payload 已 400 拦截，此处为 store 层兜底（直接调用者也 fail loud）。
+        """
+        if not events:
+            events = []
+        if len(events) > MAX_TASK_EVENTS_INGEST:
+            raise ValueError(
+                f"task 事件批超限（{len(events)} > {MAX_TASK_EVENTS_INGEST}）："
+                "不截断、不推进 cursor，请分批推送")
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    if events:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO " + TASK_EVENTS_TABLE +
+                            " (project_id, seq, event_json) VALUES (?,?,?)",
+                            [(project_id, ev["seq"],
+                              json.dumps(ev, ensure_ascii=False, sort_keys=True))
+                             for ev in events],
+                        )
+                    if cursor is not None:
+                        row = conn.execute(
+                            "SELECT task_cursor FROM ingest_state WHERE project_id=?",
+                            (project_id,),
+                        ).fetchone()
+                        old = row[0] if row is not None else None
+                        if old is None or cursor > old:
+                            conn.execute(
+                                "UPDATE ingest_state SET task_cursor=?"
+                                " WHERE project_id=?",
+                                (cursor, project_id),
+                            )
+            finally:
+                conn.close()
+
+    def read_task_events(self, project_id, limit=10):
+        """读取 task 事件流 → (count, cursor, items)。
+
+        count = 该项目 task_events 总行数；cursor = 已确认覆盖的最大 seq（未推送 → None）；
+        items = 最近 limit 条按 seq 降序（最新在前），每条为事件 dict（含 seq）。
+        limit ≤ 0 → 不返回事件（count/cursor 仍可用）；local transport 项目 → (0, None, [])。
+        """
+        limit = max(0, int(limit))
         with self.lock:
             conn = self._connect()
             try:
                 row = conn.execute(
-                    "SELECT project_id, payload_json, last_seen, agent_id"
+                    "SELECT task_cursor FROM ingest_state WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()
+                cursor = row[0] if row is not None else None
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM " + TASK_EVENTS_TABLE +
+                    " WHERE project_id=?", (project_id,),
+                ).fetchone()[0]
+                if limit:
+                    rows = conn.execute(
+                        "SELECT event_json FROM " + TASK_EVENTS_TABLE +
+                        " WHERE project_id=? ORDER BY seq DESC LIMIT ?",
+                        (project_id, limit),
+                    ).fetchall()
+                else:
+                    rows = []
+            finally:
+                conn.close()
+        items = [json.loads(r[0]) for r in rows]
+        return count, cursor, items
+
+    def read(self, project_id):
+        """读取一行 → {project_id, payload, last_seen, agent_id, task_cursor}；无记录 → None。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT project_id, payload_json, last_seen, agent_id, task_cursor"
                     " FROM ingest_state WHERE project_id=?",
                     (project_id,),
                 ).fetchone()
@@ -992,7 +1207,7 @@ class IngestStore:
         if row is None:
             return None
         return {"project_id": row[0], "payload": json.loads(row[1]),
-                "last_seen": row[2], "agent_id": row[3]}
+                "last_seen": row[2], "agent_id": row[3], "task_cursor": row[4]}
 
     def read_all(self):
         """枚举全部 ingest_state 行（供采集层按 transport 选 agent 项目，TASK-038）。"""
@@ -1000,13 +1215,13 @@ class IngestStore:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    "SELECT project_id, payload_json, last_seen, agent_id"
+                    "SELECT project_id, payload_json, last_seen, agent_id, task_cursor"
                     " FROM ingest_state ORDER BY project_id",
                 ).fetchall()
             finally:
                 conn.close()
         return [{"project_id": r[0], "payload": json.loads(r[1]),
-                 "last_seen": r[2], "agent_id": r[3]} for r in rows]
+                 "last_seen": r[2], "agent_id": r[3], "task_cursor": r[4]} for r in rows]
 
 
 class IngestRateLimiter:
@@ -1574,11 +1789,214 @@ class TokenIssuer:
         remove_token(project_id, self.agents_path)
 
 
+_DOWNLINK_SECRET_RE = re.compile(r"(?i)authorization|bearer|token")
+
+
+def scrub_downlink_tail(text, max_lines=DOWNLINK_TAIL_MAX_LINES):
+    """回报 tail 脱敏 + 截断（TASK-035，AGENT-DOWNLINK-CONTRACT §四）。
+
+    剔除含凭据字样（authorization/bearer/token）的行——敏感数据不入下行通道/日志
+    （security-policy Rule of Two：② 不叠加）；行数钳制 ≤ max_lines。
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    lines = [ln for ln in text.splitlines() if not _DOWNLINK_SECRET_RE.search(ln)]
+    return "\n".join(lines[:max_lines])
+
+
+def validate_downlink_body(body):
+    """入队 schema 校验（TASK-035，契约 §二）；合法返回规范化 dict，非法返回错误消息 str。"""
+    if not isinstance(body, dict):
+        return "请求体必须是 JSON 对象"
+    project_id = body.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        return "project_id 必须是非空字符串"
+    dedup_key = body.get("dedup_key")
+    if not isinstance(dedup_key, str) or not dedup_key:
+        return "dedup_key 必须是非空字符串"
+    command = body.get("command")
+    if not isinstance(command, dict):
+        return "command 必须是对象"
+    name = command.get("name")
+    if name not in ALLOWED_DOWNLINK_COMMANDS:
+        return "command.name 不在白名单"
+    args = command.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return "command.args 必须是字符串数组"
+    timeout_secs = body.get("timeout_secs", 1800)
+    if not isinstance(timeout_secs, int) or not (1 <= timeout_secs <= 86400):
+        return "timeout_secs 必须是 1..86400 的整数"
+    return {"project_id": project_id, "dedup_key": dedup_key,
+            "command": {"name": name, "args": args}, "timeout_secs": timeout_secs}
+
+
+class DownlinkStore:
+    """下行指令队列存储层（TASK-035，AGENT-DOWNLINK-CONTRACT §二/§三）：stdlib sqlite3。
+
+    表 downlink_commands(command_id PK AUTOINCREMENT, dedup_key, project_id,
+    command_json, timeout_secs, status, created_by, created_at, picked_at,
+    finished_at, attempt, result_json)：
+    - command_id 即契约 seq（AUTOINCREMENT 单调递增，乱序/重放检测依据）
+    - 部分唯一索引 idx_dl_dedup：dedup_key 在 queued/running 态唯一（幂等入队 409 依据）；
+      终态后同 key 可再次入队（重试场景）
+    - 指令状态机（契约 §三）：queued →(pickup)→ running →(result)→ done/failed/skipped；
+      pickup 超时 → 重投（attempt+1，≤ max_requeue）→ failed(human)
+    - 连接模式复用 HistoryStore/IngestStore：每次操作独立连接 + WAL + 幂等建表自愈。
+    """
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS downlink_commands(
+                command_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedup_key TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                command_json TEXT NOT NULL,
+                timeout_secs INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                created_by TEXT,
+                created_at REAL,
+                picked_at REAL,
+                finished_at REAL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT)""")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dl_dedup ON downlink_commands(dedup_key) "
+            "WHERE status IN ('queued','running')")
+        return conn
+
+    @staticmethod
+    def _row_to_dict(row):
+        if row is None:
+            return None
+        d = dict(row)
+        d["command"] = json.loads(d.pop("command_json"))
+        if d.get("result_json"):
+            d["result"] = json.loads(d.pop("result_json"))
+        else:
+            d.pop("result_json", None)
+        d["seq"] = d["command_id"]
+        return d
+
+    def enqueue(self, project_id, dedup_key, command, timeout_secs, created_by, now):
+        """入队；返回 (row, reused)。reused=True 表示 dedup_key 已有未终态指令（409 语义）。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                existing = conn.execute(
+                    "SELECT * FROM downlink_commands WHERE dedup_key=? AND status IN ('queued','running')",
+                    (dedup_key,)).fetchone()
+                if existing is not None:
+                    return self._row_to_dict(existing), True
+                cur = conn.execute(
+                    "INSERT INTO downlink_commands(dedup_key, project_id, command_json, timeout_secs,"
+                    " status, created_by, created_at) VALUES(?,?,?,?,?,?,?)",
+                    (dedup_key, project_id, json.dumps(command, ensure_ascii=False),
+                     timeout_secs, "queued", created_by, now))
+                conn.commit()
+                row = conn.execute("SELECT * FROM downlink_commands WHERE command_id=?",
+                                   (cur.lastrowid,)).fetchone()
+                return self._row_to_dict(row), False
+            finally:
+                conn.close()
+
+    def pickup(self, allowed_projects, now,
+               pickup_timeout=DOWNLINK_PICKUP_TIMEOUT_DEFAULT,
+               max_requeue=DOWNLINK_MAX_REQUEUE):
+        """拾取（契约 §三/§五）：先回收超时未拾取指令（重投/判死），再领取 allowed 内最旧 queued。
+
+        - 超时 queued：attempt ≥ max_requeue → failed(pickup-timeout, human)；否则重投
+          （created_at 刷新 + attempt+1，pickup 超时窗口重新计时）
+        - 领取即置 running（picked_at=now），pickup 超时窗口自此终止——执行期只有
+          timeout_secs 生效（R2-001：「忙而非死」不误判 stale）
+        - allowed_projects 为空（fail-closed）→ 不下发任何指令
+        """
+        with self.lock:
+            conn = self._connect()
+            try:
+                stale = conn.execute(
+                    "SELECT * FROM downlink_commands WHERE status='queued' AND created_at IS NOT NULL").fetchall()
+                for row in stale:
+                    if now - row["created_at"] <= pickup_timeout:
+                        continue
+                    if row["attempt"] >= max_requeue:
+                        conn.execute(
+                            "UPDATE downlink_commands SET status='failed', finished_at=?, result_json=?"
+                            " WHERE command_id=?",
+                            (now, json.dumps({"reason": "pickup-timeout",
+                                              "attempts": row["attempt"] + 1}), row["command_id"]))
+                    else:
+                        conn.execute(
+                            "UPDATE downlink_commands SET created_at=?, attempt=attempt+1"
+                            " WHERE command_id=?", (now, row["command_id"]))
+                conn.commit()
+                if not allowed_projects:
+                    return None
+                marks = ",".join("?" for _ in allowed_projects)
+                row = conn.execute(
+                    f"SELECT * FROM downlink_commands WHERE status='queued' AND project_id IN ({marks})"
+                    " ORDER BY command_id LIMIT 1", tuple(allowed_projects)).fetchone()
+                if row is None:
+                    return None
+                conn.execute(
+                    "UPDATE downlink_commands SET status='running', picked_at=? WHERE command_id=?",
+                    (now, row["command_id"]))
+                conn.commit()
+                return self._row_to_dict(conn.execute(
+                    "SELECT * FROM downlink_commands WHERE command_id=?",
+                    (row["command_id"],)).fetchone())
+            finally:
+                conn.close()
+
+    def result(self, command_id, status, exit_code, stdout_tail, stderr_tail, now):
+        """回报终态；返回 (row, already_terminal)。already_terminal=True → 409 幂等忽略（契约 §五）。"""
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute("SELECT * FROM downlink_commands WHERE command_id=?",
+                                   (command_id,)).fetchone()
+                if row is None:
+                    return None, False
+                if row["status"] in DOWNLINK_TERMINAL_STATUSES:
+                    return self._row_to_dict(row), True
+                result = {"status": status, "exit_code": exit_code,
+                          "stdout_tail": stdout_tail, "stderr_tail": stderr_tail,
+                          "finished_at": now}
+                conn.execute(
+                    "UPDATE downlink_commands SET status=?, finished_at=?, result_json=?"
+                    " WHERE command_id=?",
+                    (status, now, json.dumps(result, ensure_ascii=False), command_id))
+                conn.commit()
+                return self._row_to_dict(conn.execute(
+                    "SELECT * FROM downlink_commands WHERE command_id=?",
+                    (command_id,)).fetchone()), False
+            finally:
+                conn.close()
+
+    def get(self, command_id):
+        with self.lock:
+            conn = self._connect()
+            try:
+                return self._row_to_dict(conn.execute(
+                    "SELECT * FROM downlink_commands WHERE command_id=?",
+                    (command_id,)).fetchone())
+            finally:
+                conn.close()
+
+
 class State:
     """聚合缓存 + 后台轮询线程（daemon）。"""
 
     def __init__(self, config, quiet=False, db_path=None, ingest_db_path=None, agents_path=None,
-                 rate_clock=None, registration_db_path=None, projects_path=None):
+                 rate_clock=None, registration_db_path=None, projects_path=None, notify=None,
+                 downlink_db_path=None, start_poller=True):
         self.config = config
         self.quiet = quiet
         self.lock = threading.Lock()
@@ -1592,12 +2010,22 @@ class State:
         # agent 推送存储（TASK-033/034）：默认 <ROOT>/data/ingest.db，测试可注入临时路径
         ingest_db_path = ingest_db_path or os.path.join(ROOT, *INGEST_DB_REL)
         self.ingest = IngestStore(ingest_db_path)
+        # 下行指令队列（TASK-035，AGENT-DOWNLINK-CONTRACT）：默认 <ROOT>/data/downlink.db，
+        # 测试可注入临时路径
+        downlink_db_path = downlink_db_path or os.path.join(ROOT, *DOWNLINK_DB_REL)
+        self.downlink = DownlinkStore(downlink_db_path)
         # agent token 配置（TASK-035）：config/agents.json（权限 600，gitignored），测试可注入临时路径
         agents_path = agents_path or os.path.join(ROOT, *AGENTS_CONFIG_REL)
         self.agents_path = agents_path
         self.agents = load_agents_config(agents_path)
         if not self.agents:
-            self._log(f"⚠ {os.path.relpath(agents_path, ROOT)} 缺失或不可用 → "
+            # 跨盘符（Windows C:/D:）os.path.relpath 抛 ValueError（SMELL-002，TASK-035 返工）：
+            # 与 _rel 同语义兜底——降级为绝对路径日志，绝不因告警路径崩启动
+            try:
+                agents_rel = os.path.relpath(agents_path, ROOT)
+            except ValueError:
+                agents_rel = agents_path
+            self._log(f"⚠ {agents_rel} 缺失或不可用 → "
                       "/api/ingest 全部 401（fail-closed）")
         # ingest 限流（TASK-036）：每 agent 每分钟 N 次（config.projects.json 顶层可配置）；
         # rate_clock 仅供测试注入确定性时钟，生产用 time.time
@@ -1618,7 +2046,19 @@ class State:
             config.get("register_rate_limit_per_minute", 60),
             clock=rate_clock or time.time,
         )
-        self._start_poller()
+        # 告警通知渠道（TASK-072）：缺省按 config/notify.json / 环境变量构建；测试可注入
+        webhook_cfg = load_notify_config().get("webhook") or {}
+        self.notifier = (notify if notify is not None else
+                         NotificationSender(webhook_url=webhook_cfg.get("url") or "",
+                                            token=webhook_cfg.get("token") or ""))
+        # 最近一次已投递告警指纹（TASK-072 防抖：告警集合变化才通知，相同告警不重复轰炸）
+        self._last_alert_fp = None
+        # TASK-083：测试可禁用后台 poller（改同步 poll() 消除首轮轮询竞态 + 避免孤儿线程）；
+        # 缺省 True → 生产行为零变化（启动后首轮轮询仍立即执行）
+        if start_poller:
+            self._start_poller()
+        else:
+            self._log("后台轮询已禁用（start_poller=False）")
 
     def _log(self, msg):
         if not self.quiet:
@@ -1643,7 +2083,37 @@ class State:
         with self.lock:
             self.payload = self._build_payload(data)
         self._record_history(data)
+        self._notify_alerts(data)
         self._log(f"轮询完成：{len(data)} 个项目，耗时 {time.time() - t0:.2f}s")
+
+    def _notify_alerts(self, data):
+        """TASK-072：轮询后比较告警指纹，集合变化时投递 webhook 通知（防抖）。
+
+        - 未配置/禁用 → 直接返回（通知是增强能力，不影响轮询）
+        - 指纹 = 全部告警条目稳定字段（project/kind/role/text）排序元组——
+          相同告警不重复轰炸；告警清空时重置指纹，下次再出现会再次通知
+        - 投递成功才更新指纹；失败保留旧指纹 → 下一轮自动重试（最终一致）
+        - 通知失败只记日志，绝不抛异常
+        """
+        notifier = self.notifier
+        if notifier is None or not notifier.enabled:
+            return
+        items = []
+        for p in data:
+            items.extend(p.get("alerts") or [])
+        if not items:
+            self._last_alert_fp = None
+            return
+        fp = tuple(sorted((a.get("project"), a.get("kind"), a.get("role"), a.get("text"))
+                          for a in items))
+        if fp == self._last_alert_fp:
+            return
+        ok, detail = notifier.send(items, generated_at=time.time())
+        if ok:
+            self._last_alert_fp = fp
+            self._log(f"告警通知已投递：{len(items)} 条（{detail}）")
+        else:
+            self._log(f"告警通知投递失败：{detail}（下轮重试）")
 
     def _record_history(self, data):
         """每轮为每个读取成功的项目写历史快照（TASK-022）。
@@ -1795,6 +2265,41 @@ def validate_ingest_payload(obj):
             if val is not None:
                 if isinstance(val, bool) or not isinstance(val, int) or val < 0:
                     return f"files.{key} 必须为非负整数或 null"
+
+    # TASK-071：task 事件流（payload 顶层 events/cursor，TASK-066 agent 增量推送）。
+    # 宽松语义：缺省/空 events = 未启用或本轮无新事件（向后兼容，旧 payload 无此键仍 200）。
+    # seq 规则沿用 TASK-065 `task validate` 既有规则：整数、≥1（拒绝负 seq/0）、批内单调递增
+    # （seq 必须大于上一条）；cursor 为已确认覆盖最大 seq：整数、≥0、不得小于批量最大 seq；
+    # 单批 ≤ MAX_TASK_EVENTS_INGEST（超限 400，FIND-003 fail loud，不静默截断）。
+    cursor = obj.get("cursor")
+    if cursor is not None:
+        if isinstance(cursor, bool) or not isinstance(cursor, int):
+            return "cursor 必须为整数或 null"
+        if cursor < 0:
+            return "cursor 必须 ≥ 0（拒绝负 cursor）"
+    events = obj.get("events")
+    if events is not None:
+        if not isinstance(events, list):
+            return "events 必须为数组（task 事件增量）"
+        # TASK-071 FIND-003：超批 fail loud（400）——agent README 契约「≤ 200 条/批」；
+        # 静默截断会让 seq 201..N 永久丢失而 cursor 仍宣称覆盖（不静默丢弃事件不变量）。
+        if len(events) > MAX_TASK_EVENTS_INGEST:
+            return (f"events 超出单批上限（{MAX_TASK_EVENTS_INGEST} 条），请分批推送"
+                    f"（收到 {len(events)} 条）")
+        last_seq = None
+        for i, entry in enumerate(events):
+            if not isinstance(entry, dict):
+                return f"events[{i}] 必须为对象"
+            seq = entry.get("seq")
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                return f"events[{i}].seq 必须为整数"
+            if seq < 1:
+                return f"events[{i}].seq 必须 ≥ 1（拒绝负 seq/0）"
+            if last_seq is not None and seq <= last_seq:
+                return f"events[{i}].seq 非单调（{seq} ≤ 上一条 {last_seq}）"
+            last_seq = seq
+        if events and cursor is not None and cursor < last_seq:
+            return f"cursor（{cursor}）小于批量最大 seq（{last_seq}），违反确认语义"
     return None
 
 
@@ -1814,7 +2319,11 @@ def load_agents_config(path=None):
     if not os.path.isfile(path):
         return {}
     try:
-        if os.stat(path).st_mode & 0o077:
+        # POSIX 600 检查（fail-closed）：NTFS 无 POSIX 权限位（st_mode 恒 0o666/0o444，
+        # chmod 仅能切只读），0o077 检查在 Windows 上永真 → agents.json 永不可用；
+        # Windows 访问控制由 NTFS ACL 接管，跳过本检查（TASK-035：下行队列需在本机
+        # Windows 跑测试/集成验证）；POSIX 平台维持原检查不变
+        if os.name != "nt" and os.stat(path).st_mode & 0o077:
             print(f"⚠ {path} 权限不是 600（group/other 可读），拒绝加载 token（fail-closed）",
                   file=sys.stderr)
             return {}
@@ -2064,6 +2573,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if m:
             self._register_status(m.group(1), query)
             return
+        # 下行指令队列（TASK-035）：agent 拾取 / dispatcher 状态轮询
+        if path == "/api/downlink/pickup":
+            self._downlink_pickup()
+            return
+        m = DOWNLINK_STATUS_RE.match(path)
+        if m:
+            self._downlink_status(int(m.group(1)))
+            return
         if path == "/api/register/codes":
             self._enrollment_codes_list(query)
             return
@@ -2115,6 +2632,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if m:
             self._enrollment_code_revoke(m.group(1))
             return
+        # 下行指令队列（TASK-035）：dispatcher 入队 / agent 回报
+        if path == "/api/downlink/commands":
+            self._downlink_enqueue()
+            return
+        m = DOWNLINK_RESULT_RE.match(path)
+        if m:
+            self._downlink_result(int(m.group(1)))
+            return
         if path == "/api/register":
             self._register()
             return
@@ -2156,6 +2681,128 @@ class ApiHandler(BaseHTTPRequestHandler):
         if len(data) > MAX_INGEST_PAYLOAD_BYTES:
             return None, f"payload 超限（上限 {MAX_INGEST_PAYLOAD_BYTES} 字节）"
         return data, None
+
+    # ------------------------------------------------------------------
+    # 下行指令队列 handlers（TASK-035，AGENT-DOWNLINK-CONTRACT §一~§五）
+    # ------------------------------------------------------------------
+    def _downlink_auth(self):
+        """Bearer 鉴权 + 限流；失败时已写响应并返回 None（顺序同 do_POST：先 401 再 429）。"""
+        token = extract_bearer_token(self.headers.get("Authorization", ""))
+        agent_id = resolve_agent_id(ApiHandler.state.agents, token)
+        if agent_id is None:
+            self._json_error(401, "鉴权失败")
+            return None
+        if not ApiHandler.state.rate_limiter.allow(agent_id):
+            self._json_error(429, "请求过于频繁，请稍后重试")
+            return None
+        return agent_id
+
+    def _downlink_enqueue(self):
+        """POST /api/downlink/commands：dispatcher 入队（契约 §二/§五）。
+
+        鉴权 → 限流 → schema（400）→ 注册表闸门（400：未登记 / transport=local）→
+        入队；dedup_key 未终态重复 → 409（extra 带既有 command_id/seq，幂等入队依据）。
+        """
+        agent_id = self._downlink_auth()
+        if agent_id is None:
+            return
+        data, err = self._read_body()
+        if err:
+            self._json_error(413, err)
+            return
+        try:
+            body = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._json_error(400, "请求体不是合法 JSON")
+            return
+        spec = validate_downlink_body(body)
+        if isinstance(spec, str):
+            self._json_error(400, spec)
+            return
+        registry = load_projects_config(ApiHandler.state.projects_path)
+        entry = next((p for p in registry.get("projects", [])
+                      if isinstance(p, dict) and p.get("id") == spec["project_id"]), None)
+        if entry is None:
+            self._json_error(400, "project_id 未登记")
+            return
+        if entry.get("transport") == "local":
+            self._json_error(400, "transport=local 条目不支持下行指令")
+            return
+        row, reused = ApiHandler.state.downlink.enqueue(
+            spec["project_id"], spec["dedup_key"], spec["command"],
+            spec["timeout_secs"], agent_id, time.time())
+        if reused:
+            self._json_error(409, "dedup_key 已有未终态指令",
+                             {"command_id": row["command_id"], "seq": row["seq"]})
+            return
+        self._json({"command_id": row["command_id"], "seq": row["seq"], "status": row["status"]})
+
+    def _downlink_pickup(self):
+        """GET /api/downlink/pickup：agent 拾取（契约 §三）。
+
+        鉴权 → per-token 项目白名单（fail-closed：空集合不下发）→ 回收超时 → 领取。
+        无可领指令 → command=null（等价队列空，不泄露他项目信息）。
+        """
+        agent_id = self._downlink_auth()
+        if agent_id is None:
+            return
+        allowed = authorized_projects(ApiHandler.state.agents, agent_id)
+        cmd = ApiHandler.state.downlink.pickup(allowed, time.time())
+        self._json({"command": cmd})
+
+    def _downlink_result(self, command_id):
+        """POST /api/downlink/commands/{id}/result：agent 回报（契约 §四/§五）。
+
+        鉴权 → schema（400）→ 指令存在（404）→ 项目授权（403）→ 脱敏截断 → 落终态；
+        已终态 → 409 幂等忽略（extra 带既有状态）。
+        """
+        agent_id = self._downlink_auth()
+        if agent_id is None:
+            return
+        data, err = self._read_body()
+        if err:
+            self._json_error(413, err)
+            return
+        try:
+            body = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._json_error(400, "请求体不是合法 JSON")
+            return
+        status = body.get("status")
+        if status not in DOWNLINK_TERMINAL_STATUSES:
+            self._json_error(400, "status 必须是 done/failed/skipped")
+            return
+        try:
+            exit_code = int(body.get("exit_code", -1))
+        except (TypeError, ValueError):
+            self._json_error(400, "exit_code 必须是整数")
+            return
+        row = ApiHandler.state.downlink.get(command_id)
+        if row is None:
+            self._json_error(404, "指令不存在")
+            return
+        if not is_project_authorized(ApiHandler.state.agents, agent_id, row["project_id"]):
+            self._json_error(403, "project_id 不在授权范围")
+            return
+        stored, already = ApiHandler.state.downlink.result(
+            command_id, status, exit_code,
+            scrub_downlink_tail(body.get("stdout_tail", "")),
+            scrub_downlink_tail(body.get("stderr_tail", "")), time.time())
+        if already:
+            self._json_error(409, "指令已终态（幂等忽略）", {"command_id": command_id, "status": stored["status"]})
+            return
+        self._json({"command_id": command_id, "status": stored["status"]})
+
+    def _downlink_status(self, command_id):
+        """GET /api/downlink/commands/{id}：dispatcher 轮询状态（契约 §一/§四）。"""
+        agent_id = self._downlink_auth()
+        if agent_id is None:
+            return
+        row = ApiHandler.state.downlink.get(command_id)
+        if row is None:
+            self._json_error(404, "指令不存在")
+            return
+        self._json({"command": row})
 
     def _ingest(self, agent_id):
         data, err = self._read_body()
@@ -2202,6 +2849,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             # 同 id 双 agent 冲突（§3.1.6）：记录 owner（agent id 非密钥），后到者拒绝、不覆盖
             self._json_error(409, f"项目已被另一 agent 占用（当前归属: {detail}）")
             return
+        # TASK-071：task 事件流入库（解析/校验已在 validate_ingest_payload 完成）。
+        # 事件落库失败返回 500（不 200）——事件是审计级真相，静默丢弃会破坏「推了有人收」
+        # 的闭环；files 快照与 task 事件分开存储，互不影响既有 ingest_state 语义。
+        events = obj.get("events")
+        if events is not None:
+            try:
+                ApiHandler.state.ingest.store_task_events(
+                    project_id, events, obj.get("cursor"))
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%F %T')}] task 事件落库失败 "
+                      f"project_id={project_id}: {type(e).__name__}: {e}", file=sys.stderr)
+                self._json_error(500, "task 事件落库失败")
+                return
         # TASK-040：ingest 到达 → 立即写 HistoryStore 快照（趋势即时反映推送；/api/history 对
         # agent 项目不回归）。best-effort：失败不影响 ingest 200——推送已落库 ingest_state，
         # 轮询仍会补采样（§3.1.4 恢复推送自动恢复）；仅记服务端日志。
@@ -2838,7 +3498,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         """GET /api/projects/<id>/events?limit=<n>（TASK-023，见 MONITOR-SPEC §4.3）。
 
         项目 id 未注册 → 404；limit 默认 10、(0,100] 正整数，非法 → 400。
-        响应：{project, limit, generated_at, counts, events}，每 role 最近 limit 条 ts 降序。
+        响应：{project, limit, generated_at, counts, events, task_events}，
+        - counts/events：每 role 最近 limit 条 ts 降序（既有契约不变）；
+        - task_events（TASK-071）：{count, cursor, events}——task 事件流总条数、
+          已确认覆盖最大 seq、最近 limit 条按 seq 降序（含 seq/ts/ev/task/...）。
         """
         proj = next((p for p in ApiHandler.state.config.get("projects", [])
                      if p.get("id") == project_id), None)
@@ -2868,12 +3531,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         events, counts = {}, {}
         for who in ("coder", "reviewer"):
             counts[who], events[who] = read_events_timeline(rt, who, limit, reader)
+        # TASK-071：task 事件流从 ingest_state 的 task_events 表读（与 role 事件同端点展示）
+        try:
+            tcount, tcursor, tevents = ApiHandler.state.ingest.read_task_events(
+                project_id, limit)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%F %T')}] task 事件读取失败 "
+                  f"project_id={project_id}: {type(e).__name__}: {e}", file=sys.stderr)
+            self._json_error(500, "task 事件读取失败")
+            return
         self._json({
             "project": project_id,
             "limit": limit,
             "generated_at": time.time(),
             "counts": counts,
             "events": events,
+            "task_events": {
+                "count": tcount,
+                "cursor": tcursor,
+                "events": tevents,
+            },
         })
 
     def _static(self):

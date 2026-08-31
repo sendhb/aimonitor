@@ -52,6 +52,9 @@ config/agents.example.json
 # 管理员密码（TASK-049：自动生成，gitignored）
 config/admin.json
 
+# 告警通知 webhook 配置（TASK-072：url/token 机密，gitignored；示例见 MONITOR-SPEC §4.7）
+config/notify.json
+
 # 生成目录（generated_dirs，只由生成器写入）
 dist/
 

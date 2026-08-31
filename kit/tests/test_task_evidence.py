@@ -107,10 +107,12 @@ class CmdDoneTests(unittest.TestCase):
         task.REVIEW_DIR = str(root / "reviews")
         task.TASKS_DIR = str(root / "tasks")
         task.STATE_DIR = str(root / "states")
+        task.LOG_DIR = str(root / "logs")  # TASK-066：隔离事件流，防污染真实 runtime/logs
         Path(task.VERIFY_DIR).mkdir()
         Path(task.REVIEW_DIR).mkdir()
         Path(task.TASKS_DIR).mkdir()
         Path(task.STATE_DIR).mkdir()
+        Path(task.LOG_DIR).mkdir()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -211,7 +213,8 @@ class ReworkLimitTests(unittest.TestCase):
         task.REVIEW_DIR = str(root / "reviews")
         task.TASKS_DIR = str(root / "tasks")
         task.STATE_DIR = str(root / "states")
-        for d in (task.VERIFY_DIR, task.REVIEW_DIR, task.TASKS_DIR, task.STATE_DIR):
+        task.LOG_DIR = str(root / "logs")  # TASK-066：隔离事件流，防污染真实 runtime/logs
+        for d in (task.VERIFY_DIR, task.REVIEW_DIR, task.TASKS_DIR, task.STATE_DIR, task.LOG_DIR):
             Path(d).mkdir(parents=True)
 
     def tearDown(self):

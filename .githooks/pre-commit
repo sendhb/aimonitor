@@ -1,3 +1,10 @@
 #!/usr/bin/env bash
 # generated_dirs 保护 + commands.check —— 见 kit/cli/lib/precommit_check.py
-exec python3 "$(git rev-parse --show-toplevel)/kit/cli/lib/precommit_check.py"
+# python 解释器分派（TASK-002）：Windows 商店 stub / 缺失时回退 python
+# shellcheck source=kit/cli/lib/pick_python.sh
+source "$(git rev-parse --show-toplevel)/kit/cli/lib/pick_python.sh"
+PY="$(pick_python)" || {
+  echo "✗ pre-commit: 需要 python3 或 python（请先安装并加入 PATH）" >&2
+  exit 1
+}
+exec "$PY" "$(git rev-parse --show-toplevel)/kit/cli/lib/precommit_check.py"

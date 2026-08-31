@@ -30,6 +30,14 @@
 
 判断不清时，先作为规格影响处理并在 TASK 中记录假设。
 
+## 对话人格（按需加载 · 表达层设定）
+
+> 人格 = 表达层设定（语气/修辞/叙事），**绝不改变**推理、结论、工程判断与治理纪律。
+> 按需加载：人格不内嵌本文件，收在人格库；**当前激活人格见 `personas/active.md`**（未激活则该文件不存在 = 零加载）。
+> **进入任何 AI CLI 会话时，先运行 `kit/cli/persona ensure`**：active.md 存在则保持当前人格，缺失则自动从人格库随机激活一个。
+> 切换：`kit/cli/persona list | use <name> | off | show`（人格库见 `kit/personas/`，自定义人格放项目 `personas/`）。
+> 工具薄壳（`.pi/SYSTEM.md`、`.cursor/rules/persona.mdc`、`.github/copilot-instructions.md`）同指 `personas/active.md`，均不重复内容，避免双源漂移。
+
 ## 进阶导航
 
 - [`kit/knowledge/`](kit/knowledge/) — 框架知识库结构（项目知识在根 `knowledge/`）

@@ -19,6 +19,21 @@ jobs:
         with:
           python-version: "3.12"
       - name: framework health check
-        run: bash cli/check
+        run: bash kit/cli/check
       - name: unit tests
-        run: python3 -m unittest discover -s tests
+        run: python3 -m unittest discover -s kit/tests
+
+  check-windows:
+    # TASK-006：Windows 平台回归（Git Bash；两处信号测试在 win32 按设计跳过）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: framework health check (Git Bash)
+        shell: bash
+        run: bash kit/cli/check
+      - name: unit tests
+        shell: bash
+        run: python -m unittest discover -s kit/tests

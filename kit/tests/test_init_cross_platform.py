@@ -319,5 +319,112 @@ class SetupConfigTest(unittest.TestCase):
             self.init.setup_config(target, "nosuchprofile", non_interactive=True)
 
 
+class ApplyPersonaTest(unittest.TestCase):
+    """TASK-077：init 人格激活 apply_persona（对齐 mkproject）。
+
+    覆盖：
+    - --persona <name>：从人格库选（KIT/personas 优先，其次 SRC_ROOT/personas）并写 active.md
+    - --persona 不存在 / 人格文件为空 → SystemExit
+    - --no-persona：清除已有 active.md（零加载）
+    - 默认：继承源项目 personas/active.md
+    - 源缺失：不写 active.md（零加载）
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.init = load_script("init")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _layout(self, kit_personas=None, src_active=None):
+        """构造 kit/personas 与源项目 personas/，设置模块 KIT/SRC_ROOT。"""
+        kit = self.base / "kit"
+        src = self.base / "src"
+        if kit_personas:
+            (kit / "personas").mkdir(parents=True)
+            for name, body in kit_personas.items():
+                (kit / "personas" / f"{name}.md").write_text(body, encoding="utf-8")
+        if src_active is not None:
+            (src / "personas").mkdir(parents=True)
+            (src / "personas" / "active.md").write_text(src_active, encoding="utf-8")
+        self.init.KIT = kit
+        self.init.SRC_ROOT = src
+
+    def test_persona_from_framework_lib_writes_active(self):
+        self._layout(kit_personas={"batman": "# 蝙蝠侠\n"})
+        target = self.base / "proj"
+        msg = self.init.apply_persona(target, "batman")
+        body = (target / "personas" / "active.md").read_text(encoding="utf-8")
+        self.assertIn("当前激活人格: batman", body)
+        self.assertIn("# 蝙蝠侠", body)
+        self.assertIn("已激活人格: batman", msg)
+
+    def test_persona_framework_lib_preferred_over_source_project(self):
+        # 同名人格：框架库（KIT/personas）优先，其次源项目 personas/
+        self._layout(kit_personas={"batman": "# 框架库蝙蝠侠\n"}, src_active="not-used")
+        (self.base / "src" / "personas" / "batman.md").write_text(
+            "# 源项目蝙蝠侠\n", encoding="utf-8")
+        target = self.base / "proj"
+        self.init.apply_persona(target, "batman")
+        body = (target / "personas" / "active.md").read_text(encoding="utf-8")
+        self.assertIn("框架库蝙蝠侠", body)
+        self.assertNotIn("源项目蝙蝠侠", body)
+
+    def test_persona_from_source_project_lib(self):
+        # 框架库没有时回退源项目 personas/
+        self._layout(src_active="not-used")
+        (self.base / "src" / "personas" / "holmes.md").write_text(
+            "# 夏洛克\n", encoding="utf-8")
+        target = self.base / "proj"
+        msg = self.init.apply_persona(target, "holmes")
+        self.assertIn("已激活人格: holmes", msg)
+        self.assertIn("# 夏洛克",
+                      (target / "personas" / "active.md").read_text(encoding="utf-8"))
+
+    def test_persona_missing_exits(self):
+        self._layout()
+        with self.assertRaises(SystemExit):
+            self.init.apply_persona(self.base / "proj", "nosuchpersona")
+
+    def test_persona_empty_file_exits(self):
+        self._layout(kit_personas={"empty": ""})
+        with self.assertRaises(SystemExit):
+            self.init.apply_persona(self.base / "proj", "empty")
+
+    def test_no_persona_removes_existing_active(self):
+        self._layout()
+        target = self.base / "proj"
+        (target / "personas").mkdir(parents=True)
+        (target / "personas" / "active.md").write_text("# old\n", encoding="utf-8")
+        msg = self.init.apply_persona(target, no_persona=True)
+        self.assertFalse((target / "personas" / "active.md").exists())
+        self.assertIn("零加载", msg)
+
+    def test_no_persona_without_active_no_file(self):
+        self._layout()
+        target = self.base / "proj"
+        msg = self.init.apply_persona(target, no_persona=True)
+        self.assertFalse((target / "personas" / "active.md").exists())
+        self.assertIn("零加载", msg)
+
+    def test_default_inherits_source_active(self):
+        self._layout(src_active="SOURCE_ACTIVE_BODY")
+        target = self.base / "proj"
+        msg = self.init.apply_persona(target)
+        self.assertEqual(
+            (target / "personas" / "active.md").read_text(encoding="utf-8"),
+            "SOURCE_ACTIVE_BODY")
+        self.assertIn("已继承源激活人格", msg)
+
+    def test_default_source_missing_zero_load(self):
+        self._layout()
+        target = self.base / "proj"
+        msg = self.init.apply_persona(target)
+        self.assertFalse((target / "personas" / "active.md").exists())
+        self.assertIn("无源激活人格", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

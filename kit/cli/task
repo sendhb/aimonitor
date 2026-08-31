@@ -38,6 +38,7 @@ USAGE = """task — 任务追踪 CLI（AIOS + Reliable AI Engineering Framework�
 import os
 import re
 import sys
+import json
 import datetime
 import shutil
 import subprocess
@@ -158,7 +159,7 @@ def find_task(task_id):
     return None
 
 
-def set_status(path, new_status, force=False, require_review=False):
+def set_status(path, new_status, force=False, require_review=False, ev=None, reason=None):
     text, fm = load_task(path)
     if fm is None:
         die(f"frontmatter 缺失或损坏: {path}")
@@ -186,6 +187,8 @@ def set_status(path, new_status, force=False, require_review=False):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
     print(f"✓ {os.path.basename(path)} → {new_status}")
+    if ev:
+        append_event(ev, os.path.basename(path), from_status=cur, to_status=new_status, reason=reason)
 
 
 def check_done_prereqs(path, fm, require_review=False):
@@ -333,6 +336,7 @@ def cmd_new(args):
     print(f"✓ 已创建 {name}.md")
     print(f"  编辑: {path}")
     print(f"  开始: task start {task_id}")
+    append_event("task.created", name, to_status="open")
 
 
 def cmd_list(args):
@@ -399,7 +403,7 @@ def cmd_start(args):
     if not path:
         die(f"未找到任务: {args[0]}")
     bump_rework(path, args[0])
-    set_status(path, "in-progress")
+    set_status(path, "in-progress", ev="task.started")
     touch_focus(args[0])
 
 
@@ -414,6 +418,69 @@ def _git_commit():
         return "n/a"
 
 
+def events_path():
+    """事件文件路径：runtime/logs/task-events.jsonl（运行时数据，gitignored）。"""
+    return os.path.join(LOG_DIR, "task-events.jsonl")
+
+
+def _event_last_seq(path):
+    """读事件文件末尾段，解析最后一条合法 seq；文件缺失/不可读/损坏返回 0。
+
+    只扫尾部（默认 8 KiB 窗口）避免大文件全量读；seq 单调递增由单写者
+    （cli/task）追加写保证，读取段内的最后一条即为最新。
+    """
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return 0
+    seq = 0
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if isinstance(data, dict) and isinstance(data.get("seq"), int):
+                seq = data["seq"]
+        except ValueError:
+            continue
+    return seq
+
+
+def append_event(ev, task_id, from_status=None, to_status=None, reason=None, dispatch_ref=None):
+    """向 runtime/logs/task-events.jsonl 追加一条不可变事件（outbox 本地日志）。
+
+    TASK-065：事件是审计层与未来增量推送（TASK-066）的数据源；
+    失败只告警不阻断任务操作（任务文件已写入，事件缺失不应阻塞主流程）。
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        path = events_path()
+        seq = _event_last_seq(path) + 1
+        event = {
+            "seq": seq,
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "ev": ev,
+            "task": short_id(task_id) or task_id,
+            "from": from_status,
+            "to": to_status,
+            "actor": os.environ.get("AIOS_ACTOR") or "cli/task",
+            "commit": _git_commit(),
+            "dispatch_ref": dispatch_ref,
+            "reason": reason,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as e:
+        print(f"⚠ 事件追加失败（不影响任务操作）: {e}", file=sys.stderr)
+
+
 def cmd_verify(args):
     """真正执行 config.commands.build/lint/test/check（不是查文件形状），全部通过才写 VERIFY 记录。"""
     if not args:
@@ -423,6 +490,7 @@ def cmd_verify(args):
         die(f"未找到任务: {args[0]}")
     _, fm = load_task(path)
     task_id = short_id(fm.get("name") if fm else None) or short_id(args[0]) or args[0]
+    cur = (fm or {}).get("metadata.status")
 
     try:
         cfg = cfg_lib.load_config(AI_DIR)
@@ -472,6 +540,7 @@ def cmd_verify(args):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(body)
     print(f"✓ 全部通过，已写 {os.path.relpath(out_path, AI_DIR)}")
+    append_event("task.verified", task_id, from_status=cur, to_status=cur)
 
 
 def cmd_done(args):
@@ -480,7 +549,7 @@ def cmd_done(args):
     path = find_task(args[0])
     if not path:
         die(f"未找到任务: {args[0]}")
-    set_status(path, "done", force=False)
+    set_status(path, "done", force=False, ev="task.done")
     cmd_index([])
     print("提示: 更新 runtime/states/CURRENT_FOCUS.md 切换到下一个任务")
 
@@ -490,7 +559,7 @@ def cmd_block(args):
     if not path:
         die(f"未找到任务: {args[0]}")
     reason = args[1] if len(args) > 1 else "（未填原因）"
-    set_status(path, "blocked")
+    set_status(path, "blocked", ev="task.blocked", reason=reason)
     append_blocker(args[0], reason)
     print("提示: 更新 runtime/states/CURRENT_FOCUS.md")
 
@@ -499,7 +568,7 @@ def cmd_unblock(args):
     path = find_task(args[0])
     if not path:
         die(f"未找到任务: {args[0]}")
-    set_status(path, "in-progress")
+    set_status(path, "in-progress", ev="task.unblocked")
 
 
 def cmd_review(args):
@@ -507,7 +576,7 @@ def cmd_review(args):
     path = find_task(args[0])
     if not path:
         die(f"未找到任务: {args[0]}")
-    set_status(path, "in-review")
+    set_status(path, "in-review", ev="task.review_requested")
     touch_focus(args[0])
     print("提示: 审查通过后 task approve TASK-xxx 关闭；需返工则 task start TASK-xxx（回 in-progress）")
 
@@ -517,7 +586,7 @@ def cmd_approve(args):
     path = find_task(args[0])
     if not path:
         die(f"未找到任务: {args[0]}")
-    set_status(path, "done", require_review=True)
+    set_status(path, "done", require_review=True, ev="task.approved")
     cmd_index([])
     print("提示: 更新 runtime/states/CURRENT_FOCUS.md 切换到下一个任务")
 
@@ -526,7 +595,7 @@ def cmd_cancel(args):
     path = find_task(args[0])
     if not path:
         die(f"未找到任务: {args[0]}")
-    set_status(path, "cancelled")
+    set_status(path, "cancelled", ev="task.cancelled")
 
 
 def touch_focus(task_id):
@@ -566,12 +635,67 @@ def append_blocker(task_id, reason):
 
 # ---------------- 校验 / 索引 ----------------
 
+def validate_events():
+    """校验 task-events.jsonl：每行合法 JSON、必填字段、seq 单调递增。
+
+    返回 (errors, total)：错误数与总条数。文件缺失视为 0 条 0 错。
+    """
+    path = events_path()
+    if not os.path.exists(path):
+        return 0, 0
+    errors, total, last_seq = 0, 0, 0
+    required = ("seq", "ts", "ev", "task")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                total += 1
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    print(f"✗ task-events.jsonl:{lineno} 非合法 JSON")
+                    errors += 1
+                    continue
+                if not isinstance(data, dict):
+                    print(f"✗ task-events.jsonl:{lineno} 必须是 JSON 对象")
+                    errors += 1
+                    continue
+                missing = [k for k in required if k not in data]
+                if missing:
+                    print(f"✗ task-events.jsonl:{lineno} 缺少必填字段 {missing}")
+                    errors += 1
+                seq = data.get("seq")
+                if isinstance(seq, bool) or not isinstance(seq, int):
+                    print(f"✗ task-events.jsonl:{lineno} seq 必须是整数")
+                    errors += 1
+                elif seq <= last_seq:
+                    print(f"✗ task-events.jsonl:{lineno} seq 不单调（{seq} ≤ 上一条 {last_seq}）")
+                    errors += 1
+                else:
+                    last_seq = seq
+    except OSError as e:
+        print(f"✗ task-events.jsonl 读取失败: {e}")
+        return 1, 0
+    return errors, total
+
+
 def cmd_validate(args):
+    errors = 0
+    ev_errors, ev_total = validate_events()
+    errors += ev_errors
+    if ev_total:
+        if ev_errors:
+            print(f"✗ 事件文件共 {ev_total} 条，发现 {ev_errors} 个问题")
+        else:
+            print(f"✓ 事件文件共 {ev_total} 条，格式与 seq 校验通过")
     files = task_files()
     if not files:
         print("✓ runtime/tasks/ 为空，无需校验")
-        return
-    errors, seen = 0, set()
+        print("✗ 校验失败，{} 个错误".format(errors) if errors else "✓ 校验完成，0 错误")
+        sys.exit(1 if errors else 0)
+    seen = set()
     for f in files:
         path = os.path.join(TASKS_DIR, f)
         text, fm = load_task(path)

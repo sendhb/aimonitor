@@ -117,12 +117,19 @@ aimonitor 服务端
 | Content-Type | `application/json` |
 | 请求体 | `{ "project_id": "<id>", "ts": <epoch秒>,\n  "files": {\n    "tasks": [ { "name": "TASK-001-xxx.md", "content": "<原文>" }, ... ],\n    "focus": "<CURRENT_FOCUS 原文>" | null,\n    "heartbeats": [ { "file": "autoloop-coder.heartbeat", "mtime": <远端心跳文件mtime epoch> }, ... ],\n    "events": [ { "name": "autoloop-coder-events.jsonl", "content": "<events.jsonl 原文>" }, ... ],\n    "verification_count": <int> | null,\n    "review_count": <int> | null\n  } }`（TASK-042：请求体为 **AIOS 通用遥测格式**——aibase 组件 agent（`aibase/kit/tools/agent/`）输出的文件条目数组，role 由文件名识别；`heartbeats[].mtime` 为远端 `runtime/logs/autoloop-<role>.heartbeat` 文件 mtime，语义见 §3.1.4） |
 | 响应 | `200 { "ok": true, "project_id": "<id>" }`；失败 `400`（schema 错）/ `401`（鉴权失败）/ `409`（同 id 已被另一 agent 占用，见 §3.1.6）/ `413`（payload 超限） |
-| 幂等 | 同 `project_id` 同一 agent 重复推送覆盖写（`INSERT OR REPLACE`），无副作用；**不同 agent 推同一 id → 409** |
+| 幂等 | 同 `project_id` 同一 agent 重复推送覆盖写（`INSERT OR REPLACE` 语义；实现用 `INSERT ... ON CONFLICT DO UPDATE` 保留 `task_cursor`，见下），无副作用；**不同 agent 推同一 id → 409** |
+| 任务事件流（TASK-066/071，可选） | payload 顶层可选 `events`（数组，task 事件增量）与 `cursor`（整数，已确认覆盖最大 seq）。`events[]` 为 `{seq, ts, ev, task, from, to, actor, commit, dispatch_ref?, reason?}`；seq 整数 ≥1 且批内严格单调递增；单批 ≤ 200（超限 `400`，不静默截断）；`cursor` 整数 ≥0 且 ≥ 批内最大 seq。服务端按 `(project_id, seq)` 幂等去重；`cursor` 只推进不倒退（事件启用后混入旧 payload 重推不清空已确认 cursor） |
 | 限流 | 每 agent 每分钟 N 次（可配置），超限 `429` |
 
 > TASK-042（契约对齐）：请求体为 **AIOS 通用遥测格式**（aibase 组件 agent 输出，file-oriented）。
 > 旧 role-oriented 格式不再接受——`files.heartbeat`（dict）键显式 `400`（避免「200 但心跳数据丢失」），
 > `files.tasks`/`files.events` 旧 dict 形状按新 schema 校验拒绝（`必须为数组`）。
+
+> TASK-071（任务事件流）：ingest 可选消费 aibase `cli/task` 写入的 task 级事件
+> （`runtime/logs/task-events.jsonl`，TASK-065 增量落地 + TASK-066 传输）。
+> seq/cursor 规则与 aibase `kit/tools/agent/README.md` §事件流契约一致；旧 payload
+> （无 `events`/`cursor` 键）仍 `200`，`files` 快照照常落库，task 事件表不写入。
+> 事件落库失败 → `500`（不静默丢弃，审计级真相）。
 
 ### 3.1.4 心跳与离线语义
 
@@ -691,6 +698,59 @@ aimon_{project_id}_{uuid4}_{random_hex}
 - 阈值配置见 §2：`alert_blocked_ratio_threshold`（默认 0.2）、`alert_stale_task_days`（默认 14）。
 - 筛选（§4.5）不影响 `alerts`：任务筛选只作用于 `tasks[]`，告警为轮询时基于全量派生（聚合字段保持全量）。
 
+## 4.7 告警通知渠道（webhook，TASK-072）
+
+告警派生后除在仪表盘/API 可见（§4.6）外，可配置外部 webhook 把「有新告警」推送给外部系统（IM/邮件网关/自建接收器），使 blocked/stale 状态有人关注。通知是**增强能力**：未配置时轮询与 API 完全不受影响（fail-open）。
+
+### 4.7.1 配置
+
+两种方式（环境变量优先于文件）：
+
+**方式 A：环境变量**（部署注入，最简）
+
+| 环境变量 | 说明 |
+|---------|------|
+| `AIMONITOR_NOTIFY_WEBHOOK_URL` | webhook URL（必填以启用，仅接受 `http://`/`https://`） |
+| `AIMONITOR_NOTIFY_WEBHOOK_TOKEN` | 可选 Bearer token（无需鉴权的 webhook 可省略） |
+
+**方式 B：配置文件 `config/notify.json`**（权限 600，**gitignored，不入库**——url/token 为机密，security-policy）
+
+```json
+{
+  "webhook": {
+    "enabled": true,
+    "url": "https://example.com/your-webhook",
+    "token": ""
+  }
+}
+```
+
+- `enabled: false` 或文件缺失/JSON 非法/URL 非 http(s) → 通知禁用（fail-open，不抛异常、不拖垮轮询）
+- 环境变量设置后忽略文件中的 `enabled: false`（部署注入优先）
+- 示例仅文档展示；真实配置请在本机 `config/notify.json`（gitignored）或环境变量设置
+
+### 4.7.2 投递语义
+
+- **时机**：每轮轮询后，聚合全部项目告警（`alerts.items` 同序）；**告警集合变化时**才投递（防抖：相同告警不每轮重复轰炸）
+- **恢复**：告警清空时重置指纹，下次再出现会再次通知（不做专门 recovery 消息，保持最小实现）
+- **失败重试**：投递失败只记日志、保留旧指纹，下一轮自动重试（最终一致）；超时 5s 防卡死；任何失败不抛异常
+- **请求格式**：`POST <webhook_url>`，`Content-Type: application/json`，可选 `Authorization: Bearer <token>`
+
+```json
+{
+  "event": "alerts.changed",
+  "ts": 1787000000.0,
+  "count": 2,
+  "items": [
+    { "project": "x1design", "level": "warn", "kind": "blocked-ratio", "blocked": 10, "total": 32, "threshold": 0.2, "text": "blocked 占比 31% 超阈值 20%" },
+    { "project": "proj-x", "level": "error", "kind": "heartbeat-stale", "role": "coder", "text": "Coder 心跳卡死" }
+  ]
+}
+```
+
+- 条目字段 = §4.6 告警条目公共字段（`project`/`level`/`kind`/`text` + kind 附加字段），接收方可直接按 `kind` 路由
+- 端到端验证记录（TASK-072）：本地接收器收到 `alerts.changed` POST，见任务备注
+
 ## 4.1 历史快照存储（SQLite，TASK-022）
 
 后端每轮轮询为每个**读取成功**的项目写入一行快照（SQLite `data/history.db`，stdlib `sqlite3`，零第三方依赖）：
@@ -741,6 +801,11 @@ aimon_{project_id}_{uuid4}_{random_hex}
   "events": {
     "coder":    [ { "ts": 1722590000, "task": "TASK-022", "outcome": "ok" } ],
     "reviewer": [ { "ts": 1722589000, "task": "TASK-021", "outcome": "error" } ]
+  },
+  "task_events": {
+    "count": 3,
+    "cursor": 2,
+    "events": [ { "seq": 2, "ts": "2026-08-27T09:00:00", "ev": "task.started", "task": "TASK-012", "from": "open", "to": "in-progress", "actor": "cli/task", "commit": null, "dispatch_ref": null, "reason": null } ]
   }
 }
 ```
@@ -750,6 +815,10 @@ aimon_{project_id}_{uuid4}_{random_hex}
   - `limit` 按 **role 生效**：`events.coder` 与 `events.reviewer` 各返回最近 `limit` 条，避免单一 role 事件淹没时间线。
   - `events.<role>` 为 `{ts, task, outcome}` 数组，按 `ts` **降序**（最近在前）；无事件或文件缺失 → 空数组。
   - `counts.<role>` = 该文件有效事件总数（前端用于"最近 X / total"展示）。
+  - `task_events`（TASK-071，agent 项目）：`{count, cursor, events}`——task 事件流总条数、
+    已确认覆盖最大 seq（未推送 → `null`）、最近 `limit` 条按 `seq` **降序**（每条含完整事件字段
+    `seq/ts/ev/task/from/to/actor/commit/dispatch_ref/reason`）；`transport: local` 项目 → `(0, null, [])`。
+  - 向后兼容：`task_events` 为**追加键**，旧客户端忽略不影响；`counts`/`events` 形状不变。
 - 错误码：
   - 项目 id 未注册 → `404` + JSON 错误（资源型路由；与 §4.2 的"无数据 200"区分——项目存在但无事件仍 `200` + 空数组）。
   - `limit` 非数字 / 非有限数（`NaN`/`inf`，沿用 TASK-022 BUG-001 修复模式）/ 非整数 / 超出范围 → `400` + JSON 错误。

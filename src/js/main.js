@@ -786,6 +786,13 @@
       });
   }
 
+  function eventTimeSortKey(it) {
+    var ts = it.ev && it.ev.ts;
+    if (typeof ts === "number") return ts;
+    var d = Date.parse(ts);
+    return isNaN(d) ? 0 : d / 1000;
+  }
+
   function populateEvents(data) {
     var names = ["coder", "reviewer"];
     var items = [];
@@ -797,7 +804,13 @@
         items.push({ who: who, ev: ev });
       });
     });
-    items.sort(function (a, b) { return (b.ev.ts || 0) - (a.ev.ts || 0); });
+    // TASK-071：task 事件流（seq/cursor 确认）并入同一时间线展示
+    var te = data.task_events || { count: 0, cursor: null, events: [] };
+    total += te.count || 0;
+    (te.events || []).forEach(function (ev) {
+      items.push({ who: "task", ev: ev });
+    });
+    items.sort(function (a, b) { return eventTimeSortKey(b) - eventTimeSortKey(a); });
 
     els.eventsCount.textContent = "最近 " + items.length + " / " + total;
     els.events.innerHTML = "";
@@ -811,7 +824,13 @@
       var body = el("div", "tl-body");
       var time = el("div", "tl-time", formatEventTime(it.ev.ts) + " · " + it.who);
       body.appendChild(time);
-      var taskText = (it.ev.task && it.ev.task !== "-" ? it.ev.task + " → " : "") + (it.ev.outcome || "?");
+      var taskText;
+      if (it.who === "task") {
+        taskText = (it.ev.task ? it.ev.task + " " : "") + (it.ev.ev || it.ev.outcome || "?");
+        if (typeof it.ev.seq === "number") taskText += "  #" + it.ev.seq;
+      } else {
+        taskText = (it.ev.task && it.ev.task !== "-" ? it.ev.task + " → " : "") + (it.ev.outcome || "?");
+      }
       body.appendChild(el("div", "tl-task", taskText));
       item.appendChild(body);
       els.events.appendChild(item);

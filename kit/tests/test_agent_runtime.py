@@ -7,6 +7,7 @@
 - 多项目遍历：各自读取互不串扰
 - mtime 精确、非 TASK 文件忽略、非 UTF-8 容错、计数互不串扰、排序稳定
 """
+import json
 import os
 import sys
 import tempfile
@@ -206,6 +207,86 @@ class AgentRuntimeTests(unittest.TestCase):
             snap = agent_runtime.read_project_runtime(root)
             self.assertEqual([t["name"] for t in snap["tasks"]],
                              ["TASK-001-a.md", "TASK-002-b.md", "TASK-003-c.md"])
+
+
+class TaskEventStreamTests(unittest.TestCase):
+    """TASK-066 — task-events.jsonl / .push-cursor 读取与写入。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "proj")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def logs_dir(self):
+        d = os.path.join(self.root, "runtime", "logs")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def write_events(self, lines):
+        path = os.path.join(self.logs_dir(), agent_runtime.TASK_EVENTS_FILE)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_read_task_events_missing_logs_returns_none(self):
+        self.assertIsNone(agent_runtime.read_task_events(self.root))
+
+    def test_read_task_events_missing_file_returns_none(self):
+        os.makedirs(os.path.join(self.root, "runtime", "logs"))
+        self.assertIsNone(agent_runtime.read_task_events(self.root))
+
+    def test_read_task_events_parses_and_skips_corrupt(self):
+        self.write_events([
+            '{"seq": 1, "ev": "task.created", "task": "TASK-001"}',
+            "not-json",
+            '{"seq": 3, "ev": "task.done", "task": "TASK-001"}',
+        ])
+        events = agent_runtime.read_task_events(self.root)
+        self.assertEqual([e["seq"] for e in events], [1, 3])
+        self.assertEqual(events[1]["ev"], "task.done")
+
+    def test_read_task_events_empty_file_returns_empty_list(self):
+        self.write_events([])
+        self.assertEqual(agent_runtime.read_task_events(self.root), [])
+
+    def test_read_task_events_rejects_negative_seq(self):
+        """SMELL-001：负 seq 视为非法（与写端 >=1 语义对齐），不进入事件列表。"""
+        self.write_events([
+            '{"seq": -1, "ev": "bad"}',
+            '{"seq": 1, "ev": "ok"}',
+        ])
+        events = agent_runtime.read_task_events(self.root)
+        self.assertEqual([e["seq"] for e in events], [1])
+
+    def test_read_cursor_missing_returns_none(self):
+        self.assertIsNone(agent_runtime.read_push_cursor(self.root))
+
+    def test_read_cursor_valid(self):
+        with open(os.path.join(self.logs_dir(), agent_runtime.PUSH_CURSOR_FILE),
+                  "w", encoding="utf-8") as f:
+            json.dump({"seq": 7}, f)
+        self.assertEqual(agent_runtime.read_push_cursor(self.root), 7)
+
+    def test_read_cursor_invalid_returns_none(self):
+        path = os.path.join(self.logs_dir(), agent_runtime.PUSH_CURSOR_FILE)
+        for content in ("not-json", '{"seq": "x"}', '{"seq": true}', '{}'):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            self.assertIsNone(agent_runtime.read_push_cursor(self.root),
+                              msg=f"content={content!r}")
+
+    def test_write_cursor_roundtrip_atomic(self):
+        agent_runtime.write_push_cursor(self.root, 12)
+        self.assertEqual(agent_runtime.read_push_cursor(self.root), 12)
+        # tmp 文件已清理（原子替换）
+        self.assertFalse(os.path.exists(
+            os.path.join(self.logs_dir(), agent_runtime.PUSH_CURSOR_FILE + ".tmp")))
+
+    def test_write_cursor_rejects_invalid_seq(self):
+        for bad in (-1, "5", True, 1.5):
+            with self.assertRaises(ValueError, msg=f"seq={bad!r}"):
+                agent_runtime.write_push_cursor(self.root, bad)
 
 
 if __name__ == "__main__":

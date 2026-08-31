@@ -17,6 +17,8 @@
 - 读取永不抛异常：内容用 errors="replace" 解码，OSError 跳过，mtime 取 st_mtime。
 """
 import os
+import json
+import time
 
 
 def _read_text(path):
@@ -105,3 +107,70 @@ def read_project_runtime(project_path):
         "verification_count": verification_count,
         "review_count": review_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# TASK-066 事件流（outbox）读取层
+# ---------------------------------------------------------------------------
+
+TASK_EVENTS_FILE = "task-events.jsonl"
+PUSH_CURSOR_FILE = ".push-cursor"
+
+
+def _logs_dir(project_path):
+    return os.path.join(project_path, "runtime", "logs")
+
+
+def read_task_events(project_path):
+    """读取 runtime/logs/task-events.jsonl → [parsed dict]（跳过损坏行）。
+
+    与 read_project_runtime 容错语义一致：
+    - runtime/logs 缺失或 task-events.jsonl 缺失 → None（无数据）；
+    - 文件存在但为空/全损坏 → []（有数据但为空）。
+    每行必须是含整数 seq 的 JSON 对象才被接受。永不抛异常。
+    """
+    path = os.path.join(_logs_dir(project_path), TASK_EVENTS_FILE)
+    raw = _read_text(path)
+    if raw is None:
+        return None
+    events = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("seq"), int) and not isinstance(data.get("seq"), bool) and data.get("seq") >= 1:
+            events.append(data)
+    return events
+
+
+def read_push_cursor(project_path):
+    """读取 runtime/logs/.push-cursor → int（已确认推送的最大 seq）；缺失/非法 → None。"""
+    path = os.path.join(_logs_dir(project_path), PUSH_CURSOR_FILE)
+    raw = _read_text(path)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    seq = data.get("seq") if isinstance(data, dict) else None
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        return None
+    return seq
+
+
+def write_push_cursor(project_path, seq):
+    """原子写游标文件（tmp + os.replace）。seq 必须为非负整数。"""
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+        raise ValueError(f"push cursor seq 必须是非负整数（got {seq!r}）")
+    logs = _logs_dir(project_path)
+    os.makedirs(logs, exist_ok=True)
+    target = os.path.join(logs, PUSH_CURSOR_FILE)
+    tmp = os.path.join(logs, PUSH_CURSOR_FILE + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"seq": seq, "updated": time.time()}, f, sort_keys=True)
+    os.replace(tmp, target)

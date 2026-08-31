@@ -164,7 +164,7 @@ class PollOnceTests(unittest.TestCase):
         pusher = FakePusher()
         states = {}
 
-        def bad_payload(pid, snapshot):
+        def bad_payload(pid, snapshot, **kwargs):
             raise agent_payload.PayloadError("模拟构造失败")
 
         pushed, skipped, failed = agent_loop.poll_once(
@@ -730,6 +730,154 @@ class RegistrationPollingTests(unittest.TestCase):
             self.assertEqual(result, "timeout")
             self.assertEqual(len(server.requests), 1)  # 仅轮询一次，TTL 在第二次外层循环触发
             self.assertIn("请重新注册", log.err_stream.getvalue())
+
+
+class IncrementalEventsTests(unittest.TestCase):
+    """TASK-066 — _incremental_events 增量筛选与游标推进语义。"""
+
+    def ev(self, seq):
+        return {"seq": seq, "ev": "task.created", "task": "TASK-001"}
+
+    def test_none_events_returns_none_none(self):
+        self.assertEqual(agent_loop._incremental_events(None, None), (None, None))
+        self.assertEqual(agent_loop._incremental_events(None, 5), (None, None))
+
+    def test_no_cursor_returns_full_batch(self):
+        events = [self.ev(1), self.ev(2), self.ev(3)]
+        batch, cursor_out = agent_loop._incremental_events(events, None)
+        self.assertEqual([e["seq"] for e in batch], [1, 2, 3])
+        self.assertEqual(cursor_out, 3)
+
+    def test_incremental_after_cursor(self):
+        events = [self.ev(1), self.ev(2), self.ev(3), self.ev(4)]
+        batch, cursor_out = agent_loop._incremental_events(events, 2)
+        self.assertEqual([e["seq"] for e in batch], [3, 4])
+        self.assertEqual(cursor_out, 4)
+
+    def test_no_new_events_keeps_cursor(self):
+        """游标已到文件最大 seq（全部已确认）→ 本轮无新事件，游标保持。"""
+        events = [self.ev(1), self.ev(2)]
+        batch, cursor_out = agent_loop._incremental_events(events, 2)
+        self.assertEqual(batch, [])
+        self.assertEqual(cursor_out, 2)
+
+    def test_file_reset_resends_all(self):
+        """事件文件被截断/重建（cursor > 文件最大 seq）→ 全量重推，不静默丢。"""
+        events = [self.ev(1), self.ev(2)]
+        batch, cursor_out = agent_loop._incremental_events(events, 10)
+        self.assertEqual([e["seq"] for e in batch], [1, 2])
+        self.assertEqual(cursor_out, 10)  # 游标不回退（服务端按 seq 去重）
+
+    def test_empty_events_returns_empty_with_cursor(self):
+        batch, cursor_out = agent_loop._incremental_events([], None)
+        self.assertEqual(batch, [])
+        self.assertIsNone(cursor_out)
+        batch, cursor_out = agent_loop._incremental_events([], 3)
+        self.assertEqual(batch, [])
+        self.assertEqual(cursor_out, 3)
+
+    def test_batch_capped_and_cursor_linked_bug001(self):
+        """BUG-001 回归：>MAX_TASK_EVENTS 积压时截断与游标联动，尾部下轮重推不丢。"""
+        limit = agent_payload.MAX_TASK_EVENTS
+        events = [self.ev(i) for i in range(1, limit + 51)]  # 250 条（1..250）
+        batch, cursor_out = agent_loop._incremental_events(events, None)
+        self.assertEqual(len(batch), limit)
+        self.assertEqual(cursor_out, limit)  # 游标只反映实际送达的最大 seq
+        # 下一轮：从 cursor 续推尾部（201..250，共 50 条）
+        batch2, cursor_out2 = agent_loop._incremental_events(events, cursor_out)
+        self.assertEqual([e["seq"] for e in batch2], list(range(limit + 1, limit + 51)))
+        self.assertEqual(cursor_out2, limit + 50)
+        # 第三轮：全部送达，无新事件
+        batch3, cursor_out3 = agent_loop._incremental_events(events, cursor_out2)
+        self.assertEqual(batch3, [])
+        self.assertEqual(cursor_out3, limit + 50)
+
+    def test_negative_seq_cursor_out_never_negative(self):
+        """SMELL-001 兜底：即使负 seq 混入，游标也不会算出负值；
+        负 seq 的真正过滤在读取层（read_task_events 只收 seq>=1）。"""
+        events = [{"seq": -5, "ev": "bad"}, {"seq": 1, "ev": "ok"}]
+        batch, cursor_out = agent_loop._incremental_events(events, None)
+        self.assertEqual([e["seq"] for e in batch], [-5, 1])
+        self.assertEqual(cursor_out, 1)
+
+
+class PollOnceEventCursorTests(unittest.TestCase):
+    """TASK-066 — poll_once 携带事件增量并在推送成功后推进游标。"""
+
+    def make_project(self):
+        root = tempfile.mkdtemp()
+        logs = os.path.join(root, "runtime", "logs")
+        os.makedirs(logs, exist_ok=True)
+        with open(os.path.join(logs, "task-events.jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"seq": 1, "ev": "task.created", "task": "TASK-001"}\n')
+            f.write('{"seq": 2, "ev": "task.started", "task": "TASK-001"}\n')
+            f.write('{"seq": 3, "ev": "task.done", "task": "TASK-001"}\n')
+        return root, os.path.join(logs, ".push-cursor")
+
+    def test_pushes_events_and_advances_cursor_on_success(self):
+        root, cursor_path = self.make_project()
+        cfg = {"server_url": "http://127.0.0.1:1/api/ingest", "token": "t",
+               "projects": [{"id": "proj-events", "path": root}],
+               "poll_interval_seconds": 30}
+        pusher = FakePusher()
+        pushed, skipped, failed = agent_loop.poll_once(
+            cfg, states={}, log=agent_loop.AgentLog(quiet=True),
+            clock=FakeClock(0.0), push_fn=pusher)
+        self.assertEqual((pushed, skipped, failed), (1, 0, 0))
+        body = json.loads(pusher.calls[0]["body"])
+        self.assertEqual(body["project_id"], "proj-events")
+        self.assertEqual([e["seq"] for e in body["events"]], [1, 2, 3])
+        self.assertEqual(body["cursor"], 3)
+        with open(cursor_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["seq"], 3)
+
+    def test_cursor_not_advanced_on_failure(self):
+        root, cursor_path = self.make_project()
+        cfg = {"server_url": "http://127.0.0.1:1/api/ingest", "token": "t",
+               "projects": [{"id": "proj-events", "path": root}],
+               "poll_interval_seconds": 30}
+        pusher = FakePusher(errors=[agent_http.PushServerError(500, body="boom")])
+        pushed, skipped, failed = agent_loop.poll_once(
+            cfg, states={}, log=agent_loop.AgentLog(quiet=True),
+            clock=FakeClock(0.0), push_fn=pusher)
+        self.assertEqual((pushed, skipped, failed), (0, 0, 1))
+        self.assertFalse(os.path.exists(cursor_path))
+
+    def test_cursor_write_failure_logs_not_crash(self):
+        """SMELL-001：游标写失败（ValueError/OSError）只告警，不使 agent 循环崩溃。"""
+        root, cursor_path = self.make_project()
+        cfg = {"server_url": "http://127.0.0.1:1/api/ingest", "token": "t",
+               "projects": [{"id": "proj-events", "path": root}],
+               "poll_interval_seconds": 30}
+        pusher = FakePusher()
+
+        def bad_cursor_write(path, seq):
+            raise ValueError("模拟游标写入失败")
+
+        err = io.StringIO()
+        pushed, skipped, failed = agent_loop.poll_once(
+            cfg, states={}, log=agent_loop.AgentLog(quiet=True, err_stream=err),
+            clock=FakeClock(0.0), push_fn=pusher, cursor_write_fn=bad_cursor_write)
+        self.assertEqual((pushed, skipped, failed), (1, 0, 0))
+        self.assertIn("游标写入失败", err.getvalue())
+
+    def test_second_poll_only_pushes_incremental(self):
+        root, cursor_path = self.make_project()
+        cfg = {"server_url": "http://127.0.0.1:1/api/ingest", "token": "t",
+               "projects": [{"id": "proj-events", "path": root}],
+               "poll_interval_seconds": 30}
+        agent_loop.poll_once(cfg, states={}, log=agent_loop.AgentLog(quiet=True),
+                             clock=FakeClock(0.0), push_fn=FakePusher())
+        # 追加一条新事件后第二轮：只推新增的 seq=4
+        with open(os.path.join(root, "runtime", "logs", "task-events.jsonl"),
+                  "a", encoding="utf-8") as f:
+            f.write('{"seq": 4, "ev": "task.blocked", "task": "TASK-001"}\n')
+        pusher = FakePusher()
+        agent_loop.poll_once(cfg, states={}, log=agent_loop.AgentLog(quiet=True),
+                             clock=FakeClock(0.0), push_fn=pusher)
+        body = json.loads(pusher.calls[0]["body"])
+        self.assertEqual([e["seq"] for e in body["events"]], [4])
+        self.assertEqual(body["cursor"], 4)
 
 
 if __name__ == "__main__":

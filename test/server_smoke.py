@@ -158,6 +158,112 @@ def test_derive_alerts():
     print("✓ derive_project_alerts 单测")
 
 
+def test_notify_config():
+    """TASK-072：load_notify_config（缺省禁用/文件加载/环境变量覆盖/非法 URL 禁用）。"""
+    import monitor_server as ms
+    saved = {k: os.environ.get(k) for k in (ms.NOTIFY_ENV_URL, ms.NOTIFY_ENV_TOKEN)}
+    try:
+        for k in (ms.NOTIFY_ENV_URL, ms.NOTIFY_ENV_TOKEN):
+            os.environ.pop(k, None)
+        # 缺省（无文件无环境）→ {}（通知禁用，fail-open）
+        assert ms.load_notify_config(path="/nonexistent/notify.json") == {}
+        tmpdir = tempfile.mkdtemp(prefix="aimonitor-notify-")
+        try:
+            p = os.path.join(tmpdir, "notify.json")
+            # 文件加载
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"webhook": {"enabled": True, "url": "https://example.com/hook",
+                                       "token": "t"}}, f)
+            cfg = ms.load_notify_config(path=p)
+            assert cfg["webhook"]["url"] == "https://example.com/hook", cfg
+            assert cfg["webhook"]["token"] == "t", cfg
+            # 显式 enabled:false → 禁用（{}）
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"webhook": {"enabled": False, "url": "https://example.com/hook"}}, f)
+            assert ms.load_notify_config(path=p) == {}
+            # 非法 URL（非 http/https）→ 禁用
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"webhook": {"url": "ftp://x"}}, f)
+            assert ms.load_notify_config(path=p) == {}
+            # 环境变量覆盖文件（部署注入优先）
+            os.environ[ms.NOTIFY_ENV_URL] = "http://127.0.0.1:9/hook"
+            cfg2 = ms.load_notify_config(path=p)
+            assert cfg2["webhook"]["url"] == "http://127.0.0.1:9/hook", cfg2
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("✓ load_notify_config（缺省禁用/文件/环境变量覆盖/非法 URL）")
+
+
+def test_notify_sender():
+    """TASK-072：NotificationSender webhook POST 端到端（本地接收器验证请求/鉴权/payload）。"""
+    import monitor_server as ms
+
+    class Receiver(threading.Thread):
+        """最小本地 HTTP 接收器：接收一个 POST，记录请求头与 body。"""
+
+        def __init__(self):
+            super().__init__(daemon=True)
+            self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.srv.bind(("127.0.0.1", 0))
+            self.port = self.srv.getsockname()[1]
+            self.srv.listen(1)
+            self.received = []
+
+        def run(self):
+            conn, _ = self.srv.accept()
+            try:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                head, _, body = data.partition(b"\r\n\r\n")
+                clen = 0
+                for line in head.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        clen = int(line.split(b":", 1)[1].strip())
+                while len(body) < clen:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    body += chunk
+                self.received.append((head.decode("utf-8", "replace"),
+                                      body.decode("utf-8", "replace")))
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            finally:
+                conn.close()
+
+    recv = Receiver()
+    recv.start()
+    time.sleep(0.2)  # 等监听就绪
+    s = ms.NotificationSender(f"http://127.0.0.1:{recv.port}/hook", token="tok")
+    ok, detail = s.send([{"project": "p", "kind": "blocked-ratio", "text": "x"}], generated_at=123.0)
+    recv.join(timeout=5)
+    assert ok, detail
+    assert len(recv.received) == 1, recv.received
+    head, body = recv.received[0]
+    assert "Authorization: Bearer tok" in head, head
+    payload = json.loads(body)
+    assert payload["event"] == "alerts.changed" and payload["count"] == 1, payload
+    assert payload["items"][0]["kind"] == "blocked-ratio", payload
+    print("✓ NotificationSender webhook 端到端（POST/Bearer 头/payload）")
+
+    # 未配置 / 空 items → 直接失败返回，不抛异常（fail-open）
+    ok2, d2 = ms.NotificationSender("").send([{"kind": "x"}])
+    assert not ok2 and "未配置" in d2, (ok2, d2)
+    ok3, d3 = ms.NotificationSender("http://127.0.0.1:1/hook").send([])
+    assert not ok3 and "无告警" in d3, (ok3, d3)
+    print("✓ NotificationSender 未配置/空 items 不抛异常")
+
+
 def test_filereader_abstract():
     """TASK-037：FileReader 接口 + LocalReader 实现（exists/read/mtime/listdir 缺失容忍）。"""
     import monitor_server as ms
@@ -565,7 +671,8 @@ def test_status_instance_meta():
         ms.ApiHandler.state = ms.State(config, quiet=True,
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
         port = free_port()
         httpd = ms.ThreadingHTTPServer(("127.0.0.1", port), ms.ApiHandler)
@@ -698,7 +805,8 @@ def test_ingest_endpoint():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        agents_path=agents_path,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -895,6 +1003,204 @@ def test_ingest_endpoint():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_task_events_ingest():
+    """TASK-071：task 事件流服务端消费。
+
+    - validate_ingest_payload：seq 规则（整数 ≥1 / 批内单调）+ cursor 确认语义（整数 ≥0
+      且 ≥ 批内最大 seq）+ 单批 ≤200（超批 400，FIND-003）+ 旧 payload（无 events/cursor）兼容
+    - IngestStore：task_events 入库（(project_id, seq) 幂等去重）+ cursor 只进不退
+      + 旧 payload 混用不清空 cursor（FIND-002）+ 超批 store 层 fail loud（FIND-003）
+    - HTTP E2E：/api/ingest 推 events/cursor → /api/projects/:id/events 返回
+      task_events{count, cursor, events}（seq 降序），role 事件不回归
+    """
+    import monitor_server as ms
+
+    def ev(seq, **kw):
+        d = {"seq": seq, "ts": "2026-08-27T09:00:00", "ev": "task.started",
+             "task": "TASK-012", "from": "open", "to": "in-progress",
+             "actor": "cli/task", "commit": None, "dispatch_ref": None, "reason": None}
+        d.update(kw)
+        return d
+
+    def mk(events=None, cursor=None):
+        obj = {"project_id": "aimonitor", "ts": 1720000000, "files": {}}
+        if events is not None:
+            obj["events"] = events
+        if cursor is not None:
+            obj["cursor"] = cursor
+        return obj
+
+    # —— 1. validate_ingest_payload：seq/cursor 规则 + 兼容 ——
+    assert ms.validate_ingest_payload(mk([ev(1), ev(2)], cursor=2)) is None
+    assert ms.validate_ingest_payload(mk([], cursor=0)) is None        # 空批 + 心跳确认
+    assert ms.validate_ingest_payload(mk([], cursor=None)) is None
+    assert ms.validate_ingest_payload(mk()) is None                    # 旧 payload 兼容
+    for bad, why in (
+        (mk(events="x", cursor=1), "events 非数组"),
+        (mk(events=[42], cursor=1), "事件条目非对象"),
+        (mk(events=[{"seq": "1"}], cursor=1), "seq 非整数"),
+        (mk(events=[ev(1)], cursor=True), "cursor 非整数"),
+        (mk(events=[ev(1)], cursor=0), "cursor < 批内最大 seq"),
+        (mk(events=[ev(-1)], cursor=None), "负 seq"),
+        (mk(events=[ev(0)], cursor=None), "seq 0"),
+        (mk(events=[ev(1), ev(1)], cursor=1), "批内非单调"),
+        (mk(events=[ev(2), ev(1)], cursor=2), "批内倒序"),
+        (mk(events=[ev(1)], cursor=-1), "负 cursor"),
+        (mk(events=[ev(1)], cursor="2"), "cursor 字符串"),
+        (mk(events=[ev(i) for i in range(1, 202)], cursor=201), "超批 >200 应拒绝"),
+    ):
+        err = ms.validate_ingest_payload(bad)
+        assert err is not None, f"{why} 应拒绝：{bad}"
+
+    tmpdir = tempfile.mkdtemp(prefix="aimonitor-taskev-")
+    try:
+        # —— 2. IngestStore：入库 / 去重 / cursor 只进不退 / 读取 ——
+        store = ms.IngestStore(os.path.join(tmpdir, "ingest.db"))
+        store.upsert("proj-t", {"tasks": []}, "agent-1")
+        assert store.read_task_events("proj-t", 10) == (0, None, []), \
+            "未推送 task 事件 → (0, None, [])"
+        store.store_task_events("proj-t", [ev(1), ev(2)], cursor=2)
+        count, cursor, items = store.read_task_events("proj-t", 10)
+        assert (count, cursor) == (2, 2)
+        assert [e["seq"] for e in items] == [2, 1], "应按 seq 降序（最新在前）"
+        # 重放（同 seq 幂等）+ cursor 倒退 → 不重复、不倒退
+        store.store_task_events("proj-t", [ev(1)], cursor=1)
+        assert store.read_task_events("proj-t", 10)[0:2] == (2, 2), "重放不得重复计数/倒退 cursor"
+        # 增量续推
+        store.store_task_events("proj-t", [ev(3)], cursor=3)
+        count, cursor, items = store.read_task_events("proj-t", 10)
+        assert (count, cursor) == (3, 3) and items[0]["seq"] == 3
+        assert len(store.read_task_events("proj-t", 2)[2]) == 2, "limit 截断"
+        assert store.read_task_events("no-such", 10) == (0, None, [])
+        assert store.read("proj-t")["task_cursor"] == 3, "read 应含 task_cursor"
+        assert any(r["task_cursor"] == 3 for r in store.read_all()), "read_all 应含 task_cursor"
+
+        # TASK-071 FIND-002：事件启用后混入旧 payload（无 events/cursor）不得清空 task_cursor
+        store.upsert("proj-t", {"tasks": []}, "agent-1")
+        assert store.read("proj-t")["task_cursor"] == 3, "upsert 不得清空 task_cursor"
+        store.claim_or_update("proj-t", {"tasks": []}, "agent-1")
+        assert store.read("proj-t")["task_cursor"] == 3, "claim_or_update 不得清空 task_cursor"
+
+        # TASK-071 FIND-003：超批 store 层 fail loud（不截断、不推进 cursor）
+        try:
+            store.store_task_events("proj-t", [ev(i) for i in range(1, 202)], cursor=201)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(">200 条事件应抛 ValueError（fail loud）")
+        assert store.read("proj-t")["task_cursor"] == 3, "超批拒绝后 cursor 不得推进"
+        assert store.read_task_events("proj-t", 10)[0] == 3, "超批拒绝后不得落库新增行"
+
+        # —— 3. HTTP E2E：ingest 推送 → 事件查询（含 seq/cursor）→ 兼容回归 ——
+        with open(os.path.join(ROOT, "config", "projects.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        config["poll_interval_seconds"] = 3600  # 调大避免测试期间后台轮询干扰
+        config["projects"] = list(config["projects"]) + [
+            {"id": "task-proj", "name": "Task事件工程",
+             "path": "/虚拟/task-proj", "transport": "agent"},
+        ]
+        agents = {"task-proj": "flat-token-task"}
+        agents_path = _write_agents_file(tmpdir, agents)
+        ms.ApiHandler.state = ms.State(config, quiet=True,
+                                       db_path=os.path.join(tmpdir, "history.db"),
+                                       ingest_db_path=os.path.join(tmpdir, "ingest.db"),
+                                       agents_path=agents_path,
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
+        ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
+
+        port = free_port()
+        httpd = ms.ThreadingHTTPServer(("127.0.0.1", port), ms.ApiHandler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        def post(payload):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/api/ingest",
+                         body=json.dumps(payload).encode("utf-8"),
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": "Bearer flat-token-task"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
+            return resp.status, raw
+
+        def get(path):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            raw = json.loads(resp.read())
+            conn.close()
+            return resp.status, raw
+
+        base_files = {
+            "tasks": [{"name": "TASK-012.md",
+                       "content": "---\nname: TASK-012\nmetadata:\n  status: in-progress\n---\n# TASK-012\n"}],
+            "focus": "TASK-012",
+            "heartbeats": [{"file": "autoloop-coder.heartbeat", "mtime": int(time.time())}],
+            "events": [{"name": "autoloop-coder-events.jsonl",
+                        "content": '{"ts":1,"task":"TASK-012","outcome":"ok"}\n'}],
+            "verification_count": 1,
+            "review_count": 0,
+        }
+        p1 = {"project_id": "task-proj", "ts": int(time.time()),
+              "events": [ev(1, ev="task.created", task="TASK-012",
+                            **{"from": None, "to": "open"}),
+                         ev(2, ev="task.started", task="TASK-012",
+                            **{"from": "open", "to": "in-progress"})],
+              "cursor": 2, "files": base_files}
+        status, raw = post(p1)
+        assert status == 200, f"task 事件推送应 200：{status} {raw[:200]}"
+        status, data = get("/api/projects/task-proj/events?limit=10")
+        assert status == 200
+        te = data["task_events"]
+        assert te["count"] == 2 and te["cursor"] == 2, te
+        assert [e["seq"] for e in te["events"]] == [2, 1], "事件序列按 seq 降序"
+        assert te["events"][0]["ev"] == "task.started"
+        # 旧 role 事件时间线不回归（同一端点）
+        assert data["counts"]["coder"] == 1
+        assert data["events"]["coder"][0]["outcome"] == "ok"
+
+        # 增量续推（seq 3）：count=3、cursor=3
+        p2 = {"project_id": "task-proj", "ts": int(time.time()),
+              "events": [ev(3, ev="task.done", task="TASK-012",
+                            **{"from": "in-progress", "to": "done"})],
+              "cursor": 3, "files": base_files}
+        status, raw = post(p2)
+        assert status == 200, f"增量推送应 200：{status} {raw[:200]}"
+        status, data = get("/api/projects/task-proj/events?limit=10")
+        te = data["task_events"]
+        assert te["count"] == 3 and te["cursor"] == 3, te
+        assert te["events"][0]["seq"] == 3
+
+        # 非法 task 事件 → 400（seq 规则 / cursor 语义），不落库（project_id 用已授权 task-proj）
+        for bad in (
+            mk(events=[ev(-1)], cursor=None),
+            mk(events=[ev(1), ev(1)], cursor=1),
+            mk(events=[ev(2), ev(1)], cursor=2),
+            mk(events=[ev(1)], cursor=0),
+            mk(events=[ev(1)], cursor=-1),
+            mk(events=[ev(1)], cursor="2"),
+            mk(events="x", cursor=1),
+        ):
+            bad = dict(bad, project_id="task-proj")
+            status, raw = post(bad)
+            assert status == 400, f"非法 task 事件应 400：{status} {raw[:120]}"
+
+        # 旧 payload（无 events/cursor）仍 200 且不污染 task 事件流
+        p_old = {"project_id": "task-proj", "ts": int(time.time()), "files": base_files}
+        status, raw = post(p_old)
+        assert status == 200, f"旧 payload 应 200：{status} {raw[:120]}"
+        status, data = get("/api/projects/task-proj/events?limit=10")
+        assert data["task_events"]["count"] == 3, "旧 payload 不应新增 task 事件"
+
+        print("✓ TASK-071 task 事件流（validate seq/cursor / IngestStore 去重 / HTTP E2E / 兼容回归）")
+    finally:
+        httpd.shutdown()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_ingest_auth():
     """TASK-035：/api/ingest Bearer 鉴权（无/错/对 token；不泄露数据；agents.json 权限 600 fail-closed）。"""
     import monitor_server as ms
@@ -916,7 +1222,8 @@ def test_ingest_auth():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        agents_path=agents_path,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -1054,7 +1361,8 @@ def test_ingest_scope_conflict():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        agents_path=agents_path,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -1202,7 +1510,8 @@ def test_ingest_rate_limit():
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        agents_path=agents_path,
                                        rate_clock=clock,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -1310,7 +1619,8 @@ def test_ingest_history_compat():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        agents_path=agents_path,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -1494,7 +1804,8 @@ def test_agent_ingest_integration():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        agents_path=agents_path,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -1671,7 +1982,8 @@ def test_dual_machine_verify():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        agents_path=agents_path,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -2252,7 +2564,8 @@ def test_register_endpoint():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        registration_db_path=reg_db,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -2452,7 +2765,8 @@ def test_status_endpoint():
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                        registration_db_path=reg_db,
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -2659,7 +2973,8 @@ def test_register_list_endpoint():
                                            db_path=os.path.join(tmpdir, "history.db"),
                                            ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                            registration_db_path=reg_db,
-                                           projects_path=os.path.join(tmpdir, "projects.json"))
+                                           projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+            ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
             ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
             port = free_port()
@@ -2795,7 +3110,8 @@ def test_approve_reject_endpoint():
                                            ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                            agents_path=agents_path,
                                            registration_db_path=reg_db,
-                                           projects_path=os.path.join(tmpdir, "projects.json"))
+                                           projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+            ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
             ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
             port = free_port()
@@ -3175,7 +3491,8 @@ def test_revoke_renew_endpoint():
                                            ingest_db_path=os.path.join(tmpdir, "ingest.db"),
                                            agents_path=agents_path,
                                            registration_db_path=reg_db,
-                                           projects_path=os.path.join(tmpdir, "projects.json"))
+                                           projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+            ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
             ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
             port = free_port()
@@ -3448,7 +3765,8 @@ def test_server():
         ms.ApiHandler.state = ms.State(config, quiet=True,
                                        db_path=os.path.join(tmpdir, "history.db"),
                                        ingest_db_path=os.path.join(tmpdir, "ingest.db"),
-                                       projects_path=os.path.join(tmpdir, "projects.json"))
+                                       projects_path=os.path.join(tmpdir, "projects.json"), start_poller=False)
+        ms.ApiHandler.state.poll()  # TASK-083：同步完成首轮轮询（消除后台 poller 首轮竞态）
         ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
 
         port = free_port()
@@ -3722,6 +4040,8 @@ def main():
     test_task_detail_parsing()
     test_task_filters()
     test_derive_alerts()
+    test_notify_config()
+    test_notify_sender()
     test_filereader_abstract()
     test_collect_project_reader_injection()
     test_agentreader()
@@ -3730,6 +4050,7 @@ def main():
     test_status_instance_meta()
     test_ingest_store()
     test_ingest_endpoint()
+    test_task_events_ingest()
     test_ingest_auth()
     test_ingest_scope_conflict()
     test_ingest_rate_limit()

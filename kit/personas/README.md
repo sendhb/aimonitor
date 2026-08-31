@@ -7,6 +7,7 @@
 
 - **一人格一文件**：本目录下每个 `.md` 是一个完整人格（含身份/风格/硬边界/生效范围）。
 - **激活 = 复制**：`kit/cli/persona use <name>` 将所选人格内容复制到项目根 `personas/active.md`。
+- **强制激活**：进入任何 AI CLI 会话时先 `kit/cli/persona ensure`——active.md 存在则保持，缺失则随机激活一个（AI 入口薄壳均已指路）。
 - **按需加载**：工具只读 `personas/active.md` 一个文件；未激活（文件不存在）则零加载。
 - **AGENTS.md 与工具薄壳均指路、不内嵌**，避免双源漂移。
 
@@ -15,6 +16,7 @@
 ```bash
 kit/cli/persona list                  # 列出可用人格（kit/personas/ + 项目 personas/）
 kit/cli/persona use <name>            # 激活人格 → 写入 personas/active.md
+kit/cli/persona ensure                # 确保已激活：缺失时从人格库随机激活一个（AI CLI 进入时调用）
 kit/cli/persona off                   # 关闭人格 → 删除 personas/active.md（零加载）
 kit/cli/persona show                  # 显示当前激活人格
 ```

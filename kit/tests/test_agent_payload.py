@@ -258,5 +258,104 @@ class SerializationTests(unittest.TestCase):
             pass
 
 
+class TaskEventPayloadTests(unittest.TestCase):
+    """TASK-066 — payload 事件流字段：向后兼容 + 事件/游标携带 + 校验。"""
+
+    def test_without_task_events_no_new_keys(self):
+        """未启用事件流 → payload 不含 events/cursor（向后兼容）。"""
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0)
+        self.assertNotIn("events", payload)
+        self.assertNotIn("cursor", payload)
+
+    def test_with_task_events_and_cursor(self):
+        events = [{"seq": 1, "ev": "task.created", "task": "TASK-001"},
+                  {"seq": 2, "ev": "task.started", "task": "TASK-001"}]
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=events, cursor=2)
+        self.assertEqual(payload["events"], events)
+        self.assertEqual(payload["cursor"], 2)
+        self.assertEqual(payload["files"]["tasks"], None)  # 快照字段不受影响
+
+    def test_empty_events_with_cursor(self):
+        """已启用但本轮无新事件 → events=[]、cursor 保留（服务端可确认无缺口）。"""
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=[], cursor=5)
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["cursor"], 5)
+
+    def test_task_events_truncated_to_max(self):
+        events = [{"seq": i} for i in range(1, agent_payload.MAX_TASK_EVENTS + 10)]
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=events, cursor=events[-1]["seq"])
+        self.assertEqual(len(payload["events"]), agent_payload.MAX_TASK_EVENTS)
+        # SMELL-001（TASK-067）：截断后 cursor 钳制到实际放入的最大 seq
+        self.assertEqual(payload["cursor"], agent_payload.MAX_TASK_EVENTS)
+
+    def test_task_events_must_be_list(self):
+        for bad in ("events", {"seq": 1}, 42):
+            with self.assertRaises(agent_payload.PayloadError, msg=f"bad={bad!r}"):
+                agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0, task_events=bad)
+
+    def test_task_events_none_means_not_enabled(self):
+        # None 是“未启用事件流”哨兵，payload 不含 events/cursor 键
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0, task_events=None)
+        self.assertNotIn("events", payload)
+        self.assertNotIn("cursor", payload)
+
+    def test_cursor_must_be_int(self):
+        for bad in ("3", True, 1.5, []):
+            with self.assertRaises(agent_payload.PayloadError, msg=f"cursor={bad!r}"):
+                agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                            task_events=[], cursor=bad)
+
+    def test_serialize_includes_events_deterministically(self):
+        events = [{"seq": 1, "ev": "task.created", "task": "TASK-001"}]
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=events, cursor=1)
+        body = agent_payload.serialize_payload(payload)
+        parsed = json.loads(body)
+        self.assertEqual(parsed["cursor"], 1)
+        self.assertEqual(parsed["events"][0]["seq"], 1)
+
+
+class TaskEventCursorClampTests(unittest.TestCase):
+    """TASK-067 — SMELL-001：截断后 cursor 钳制到实际放入事件的最大 seq。
+
+    生产路径 `_incremental_events` 已先截批，截断通常为 no-op；本组用例把
+    「payload 自身 cursor 不变量」收敛到 build_payload 层，防未来调用方回归。
+    """
+
+    def test_truncated_cursor_clamped_to_max_seq(self):
+        """直接传 250 条 + cursor=250 → payload 200 条且 cursor=200。"""
+        events = [{"seq": i, "ev": "task.created", "task": f"TASK-{i:03d}"}
+                  for i in range(1, agent_payload.MAX_TASK_EVENTS + 51)]
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=events, cursor=250)
+        self.assertEqual(len(payload["events"]), agent_payload.MAX_TASK_EVENTS)
+        self.assertEqual(payload["cursor"], agent_payload.MAX_TASK_EVENTS)
+
+    def test_truncated_cursor_kept_when_below_max_seq(self):
+        """截断发生但 cursor 未越过实际放入的最大 seq → 原样保留（不回推）。"""
+        events = [{"seq": i} for i in range(1, agent_payload.MAX_TASK_EVENTS + 10)]
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=events, cursor=50)
+        self.assertEqual(payload["cursor"], 50)
+
+    def test_within_limit_cursor_unchanged(self):
+        """events 条数 ≤ MAX → 即使 cursor 大于最大 seq 也原样保留（无截断即无钳制）。"""
+        events = [{"seq": i} for i in range(1, 11)]
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=events, cursor=99)
+        self.assertEqual(len(payload["events"]), 10)
+        self.assertEqual(payload["cursor"], 99)
+
+    def test_empty_events_cursor_unchanged(self):
+        """events=[] → cursor 原样保留（无事件可钳，服务端仅作心跳确认）。"""
+        payload = agent_payload.build_payload("proj-1", none_snapshot(), ts=1.0,
+                                              task_events=[], cursor=5)
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["cursor"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

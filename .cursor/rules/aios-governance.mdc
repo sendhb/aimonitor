@@ -7,10 +7,10 @@ globs: **/*
 This project uses the AIOS + Reliable AI Engineering Framework.
 
 **Before any action, check:**
-1. `aios/governance/task-policy.md` — task lifecycle
-2. `aios/governance/modification-policy.md` — what files you can/cannot edit
-3. `aios/governance/security-policy.md` — security red lines
-4. `aios/governance/risk-policy.md` — risk levels (P0-P3)
+1. `kit/aios/governance/task-policy.md` — task lifecycle
+2. `kit/aios/governance/modification-policy.md` — what files you can/cannot edit
+3. `kit/aios/governance/security-policy.md` — security red lines
+4. `kit/aios/governance/risk-policy.md` — risk levels (P0-P3)
 
 **Red lines (DO NOT):**
 - Edit files in `generated_dirs`
@@ -20,5 +20,5 @@ This project uses the AIOS + Reliable AI Engineering Framework.
 
 **Standard workflow entry:**
 - Read `AGENTS.md` for navigation
-- Use `cli/task` for task management
-- Follow `aios/execution/engine.md` for execution loop
+- Use `kit/cli/task` for task management
+- Follow `kit/aios/execution/engine.md` for execution loop

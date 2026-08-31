@@ -18,6 +18,7 @@
 "echo" "✗ 本脚本是 Python 3，请勿用 bash/sh 调用（bash 会把 Python 源码当 shell 逐行解析）。正确用法: ./kit/cli/persona <子命令> 或 python3 kit/cli/persona <子命令>"
 "exit" "1"
 import os
+import random
 import sys
 
 # Windows 控制台 GBK 下 print(✓/✗/中文) 会 UnicodeEncodeError；统一强制 UTF-8。
@@ -161,11 +162,51 @@ def cmd_show():
         print("当前激活: 无（零加载）")
 
 
+def list_all_slugs():
+    """收集可选人格 slug（框架库 + 项目库），排除 active/README/INDEX 与下划线文件。"""
+    slugs = []
+    for base in (FRAME_PERSONAS, PROJECT_PERSONAS):
+        if not os.path.isdir(base):
+            continue
+        for f in sorted(os.listdir(base)):
+            if f.endswith(".md") and f not in ("active.md", "README.md", "INDEX.md") and not f.startswith("_"):
+                slugs.append(f[:-3])
+    return slugs
+
+
+def cmd_ensure():
+    """确保人格系统已激活：active.md 存在则保持；缺失则从人格库随机激活一个。"""
+    if os.path.isfile(ACTIVE_FILE) or os.path.islink(ACTIVE_FILE):
+        name = None
+        if os.path.islink(ACTIVE_FILE):
+            name = os.readlink(ACTIVE_FILE)
+        else:
+            try:
+                with open(ACTIVE_FILE, encoding="utf-8") as f:
+                    head = f.read(200)
+                if "当前激活人格:" in head:
+                    name = head.split("当前激活人格:", 1)[1].split("（", 1)[0].strip()
+            except OSError:
+                pass
+        if name:
+            print(f"✓ 人格系统已激活: {name}（personas/active.md，保持不变）")
+        else:
+            print("✓ 人格系统已激活（personas/active.md 存在，保持不变）")
+        return
+    slugs = list_all_slugs()
+    if not slugs:
+        die("人格库为空，无法随机激活（kit/personas/ 与 personas/ 下均无可选人格）")
+    choice = random.choice(slugs)
+    print(f"· 检测到未激活人格（personas/active.md 缺失），随机激活: {choice}")
+    cmd_use(choice)
+
+
 USAGE = """persona — 人格切换 CLI（按需加载）
 ================================================
 用法:
   persona list                  列出可用人格（框架库 + 项目库）
   persona use <name>            激活人格 → 写入 personas/active.md
+  persona ensure                确保已激活：缺失时从人格库随机激活一个（AI CLI 进入时调用）
   persona off                   关闭人格 → 删除 personas/active.md
   persona show                  显示当前激活人格
 """
@@ -181,6 +222,8 @@ def main():
         cmd_list()
     elif cmd == "use":
         cmd_use(args[1] if len(args) > 1 else None)
+    elif cmd == "ensure":
+        cmd_ensure()
     elif cmd == "off":
         cmd_off()
     elif cmd == "show":

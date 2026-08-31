@@ -9,6 +9,7 @@
 # 用法:
 #   kit/cli/init [目标项目根目录] [--profile <type>] [--non-interactive]
 #                [--install-deps] [--install-yes]
+#                [--persona <name>] [--no-persona]
 #
 #   --profile <type>     跳过"选 profile"这一步，直接用该类型
 #   --non-interactive    不问任何问题，把 profile 模板原样复制成
@@ -260,6 +261,48 @@ def make_symlink(target):
         print(f"    可手动创建: 将 {target / 'AGENTS.md'} 复制为 {link}")
 
 
+def apply_persona(target, persona_name=None, no_persona=False):
+    """在目标项目 personas/ 写入 active.md（对齐 mkproject apply_persona）。
+
+    优先级: --persona <name> 从人格库选 → 默认继承源 active.md → 零加载。
+    返回改动描述字符串。
+    """
+    proj_personas = target / "personas"
+    proj_personas.mkdir(parents=True, exist_ok=True)
+    active = proj_personas / "active.md"
+
+    if no_persona:
+        if active.exists() or active.is_symlink():
+            active.unlink()
+        return "已跳过人格（--no-persona，零加载）"
+
+    if persona_name:
+        # 从人格库选（框架库 kit/personas/ 优先，其次源项目 personas/）
+        src = None
+        for lib in (KIT / "personas", SRC_ROOT / "personas"):
+            p = lib / f"{persona_name}.md"
+            if p.is_file():
+                src = p
+                break
+        if src is None:
+            sys.exit(f"✗ 人格不存在: {persona_name}（可用: kit/cli/persona list）")
+        body = src.read_text(encoding="utf-8").strip()
+        if not body:
+            sys.exit(f"✗ 人格文件为空: {src}")
+        active.write_text(
+            f"<!-- 当前激活人格: {persona_name}（来源: {src}）。由 init/cli/persona 生成，勿手编；关闭: `kit/cli/persona off`。 -->\n\n{body}\n",
+            encoding="utf-8",
+        )
+        return f"已激活人格: {persona_name}（→ personas/active.md）"
+
+    # 默认：继承源项目激活状态（源仓库根 personas/active.md）
+    src_active = SRC_ROOT / "personas" / "active.md"
+    if src_active.is_file():
+        shutil.copy2(src_active, active)
+        return "已继承源激活人格（→ personas/active.md）"
+    return "无源激活人格（新项目零加载；启用: kit/cli/persona use <name>）"
+
+
 def setup_config(target, profile, non_interactive):
     """aios.config.yaml 实例化。返回是否生成了 config。"""
     config_dst = target / "aios.config.yaml"
@@ -365,6 +408,10 @@ def main():
                         help="检测 git/python3，缺失时按平台自动安装")
     parser.add_argument("--install-yes", action="store_true",
                         help="配合 --install-deps：跳过确认直接执行安装命令")
+    parser.add_argument("--persona", default="",
+                        help="人格名：从人格库（源 kit/personas/ 或源 personas/）选一个激活，写入新项目 personas/active.md")
+    parser.add_argument("--no-persona", action="store_true",
+                        help="不激活任何人格（零加载；默认继承源项目 personas/active.md）")
     args = parser.parse_args()
 
     # ---------- 依赖自举（可选） ----------
@@ -399,6 +446,9 @@ def main():
     inst_file(SRC_ROOT / ".gitattributes", target / ".gitattributes")  # TASK-009：新项目继承行尾规则
     make_symlink(target)
 
+    # ---------- 1e. 人格激活（对齐 mkproject：--persona / --no-persona / 默认继承源） ----------
+    print(apply_persona(target, args.persona or None, args.no_persona))
+
     # ---------- 2. runtime 模板 + 项目可写区 ----------
     copy_runtime_templates(target)
     for d in ("knowledge", "docs"):
@@ -426,6 +476,7 @@ def main():
     print("  AGENTS.md     — 统一入口（pi/OpenCode/Qwen Code/Cursor/Copilot 原生读取）")
     print("  CLAUDE.md     — symlink → AGENTS.md（Claude Code）")
     print("  .pi/SYSTEM.md — pi 系统提示词（治理规则注入）")
+    print("  personas/active.md — 当前激活人格（由 --persona/--no-persona/继承源决定）")
     print()
     print("下一步:")
     if config_present:

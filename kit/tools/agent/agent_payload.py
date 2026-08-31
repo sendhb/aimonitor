@@ -32,6 +32,7 @@ import time
 MAX_TASKS = 50
 MAX_EVENTS = 50
 MAX_HEARTBEATS = 50
+MAX_TASK_EVENTS = 200  # TASK-066：task 事件流单批上限（事件为结构化短记录，容量整体仍受 MAX_PAYLOAD_BYTES 约束）
 MAX_CONTENT_CHARS = 4096
 MAX_PAYLOAD_BYTES = 256 * 1024  # 256 KiB
 TRUNCATION_SUFFIX = "…[truncated]"
@@ -75,17 +76,24 @@ def _truncate_content_entries(entries, limit):
     return out
 
 
-def build_payload(project_id, snapshot, ts=None):
+def build_payload(project_id, snapshot, ts=None, task_events=None, cursor=None):
     """构造 AIOS 遥测 payload dict（应用条目数与单条内容截断）。
 
     参数:
         project_id: 项目 id（agent.json projects[].id，必填非空字符串）
         snapshot:   agent_runtime.read_project_runtime() 的返回 dict（6 个字段）
         ts:         事件时间戳（epoch 秒，int/float）；缺省取 time.time()
+        task_events: TASK-066 可选——本次要推送的 task 事件增量（list[dict]，
+            按 seq 递增；含 seq 字段）。None 表示未启用事件流（向后兼容，
+            payload 不含 events/cursor 键）；空列表表示已启用但本轮无新事件。
+        cursor:     TASK-066 可选——本次推送覆盖到的最大 seq（int 或 None）。
+            仅在 task_events 非 None 时写入 payload。
     返回:
-        {"project_id", "ts", "files": {tasks/focus/heartbeats/events/verification_count/review_count}}
+        {"project_id", "ts", "files": {...}}；启用事件流时额外含
+        {"events": [...], "cursor": ...}
     异常:
-        PayloadError: project_id 缺失/非字符串/空白；snapshot 非 dict；ts 非数字
+        PayloadError: project_id 缺失/非字符串/空白；snapshot 非 dict；ts 非数字；
+            task_events 非 list；cursor 非 int/None
     """
     if not isinstance(project_id, str) or not project_id.strip():
         raise PayloadError("project_id 必须是非空字符串（agent.json projects[].id）")
@@ -105,7 +113,28 @@ def build_payload(project_id, snapshot, ts=None):
         "verification_count": snapshot.get("verification_count"),
         "review_count": snapshot.get("review_count"),
     }
-    return {"project_id": project_id.strip(), "ts": ts, "files": files}
+    payload = {"project_id": project_id.strip(), "ts": ts, "files": files}
+    if task_events is not None:
+        if not isinstance(task_events, list):
+            raise PayloadError("task_events 必须是 list（task 事件增量）")
+        if cursor is not None and (isinstance(cursor, bool) or not isinstance(cursor, int)):
+            raise PayloadError("cursor 必须是 int 或 None")
+        included = task_events[:MAX_TASK_EVENTS]
+        # SMELL-001（TASK-067）：截断发生时把 cursor 钳制到实际放入事件的最大 seq，
+        # 使「payload 自身持有的 cursor 不变量」成立，不依赖调用方先截批。
+        # 未截断或 events 为空时 cursor 原样保留（空 events 仅作心跳确认，无事件可钳）。
+        if len(task_events) > MAX_TASK_EVENTS and cursor is not None:
+            max_seq = None
+            for ev in included:
+                seq = ev.get("seq") if isinstance(ev, dict) else None
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    if max_seq is None or seq > max_seq:
+                        max_seq = seq
+            if max_seq is not None and cursor > max_seq:
+                cursor = max_seq
+        payload["events"] = included
+        payload["cursor"] = cursor
+    return payload
 
 
 def _dumps(payload):
