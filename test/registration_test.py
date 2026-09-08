@@ -47,9 +47,9 @@ sys.path.insert(0, os.path.join(ROOT, "server"))
 # 测量口径：code-object 行号表（co_lines，与 coverage.py 同基准）上的可执行行；
 # 执行集合来自 sys.settrace + threading.settrace（HTTP handler 线程/轮询线程同样计入）。
 # 目标范围：注册子系统（TASK-050~057 功能面）——
-#   RegistrationStore / EnrollmentCodeStore / agents.json I/O / TokenIssuer（1252-1781）
-#   load_agents_config / admin 鉴权辅助（2078-2329）
-#   ApiHandler._read_body + _json/_json_error + 全部注册端点（2414-2437、2526-3096）
+#   RegistrationStore / EnrollmentCodeStore / agents.json I/O / TokenIssuer（1519-2048）
+#   load_agents_config / admin 鉴权辅助（2425-2642）
+#   ApiHandler._read_body + _json/_json_error + 全部注册端点（3221-3243、3345-3945）
 #   不含 do_GET/do_POST 分派、_ingest（TASK-034~036 自有任务/测试覆盖）、
 #   HistoryStore/IngestStore/轮询/解析器/静态资源（各自任务覆盖）。
 # 全模块覆盖率同时输出，仅作透明参考，不作验收门槛。
@@ -61,11 +61,13 @@ COVERAGE_TARGET_FILE = os.path.join(ROOT, "server", "monitor_server.py")
 # 行号再次下移——改动 monitor_server.py 结构时须同步刷新本区间，否则覆盖率断言失真。
 # TASK-072：load_notify_config/NotificationSender/State 通知钩子在 derive_project_alerts
 # 后新增 ~170 行，注册子系统整体下移——已按当前函数边界刷新）
+# TASK-073：validate sessions 分支 + parse_session_line + IngestStore session 三方法
+# （~260 行）+ _sessions/_ingest 接线（~100 行）使注册子系统再下移——已按当前函数边界刷新
 COVERAGE_SCOPE_RANGES = [
-    (1252, 1781),  # RegistrationStore / EnrollmentCodeStore / agents.json I/O / TokenIssuer（不含 State）
-    (2078, 2329),  # load_agents_config / ensure_admin_config / load_admin_config / load_projects_config / register_project_in_config / 鉴权辅助（TASK-069）
-    (2414, 2437),  # ApiHandler._read_body（注册端点读体依赖）
-    (2526, 3096),  # _json / _json_error / _register ~ _read_body_json（全部注册端点 + TASK-069 自动登记）
+    (1519, 2048),  # RegistrationStore / EnrollmentCodeStore / agents.json I/O / TokenIssuer（不含 State；TASK-073 后下移刷新）
+    (2425, 2642),  # load_agents_config / ensure_admin_config / load_admin_config / load_projects_config / register_project_in_config / 鉴权辅助（TASK-069；TASK-073 后刷新，止于 is_project_registered）
+    (3221, 3243),  # ApiHandler._read_body（注册端点读体依赖）
+    (3345, 3945),  # _json / _json_error / _register ~ _read_body_json（全部注册端点 + TASK-069 自动登记）
 ]
 COVERAGE_THRESHOLD = 85.0  # VERIFY-001：注册子系统行覆盖率 ≥ 85%
 

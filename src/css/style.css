@@ -682,3 +682,59 @@ td:first-child { max-width: 380px; }
   user-select: all;
 }
 
+
+/* ===== Session 日志（TASK-073：agent session 增量查看页，前端轮询） ===== */
+.session-live {
+  display: inline-flex; align-items: center; gap: 5px;
+  cursor: pointer; color: var(--text-dim); font-size: 12px;
+  user-select: none;
+}
+.session-live input { accent-color: var(--accent); cursor: pointer; }
+.session-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 10px 0;
+}
+.session-toolbar select {
+  background: var(--bg-card); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 6px 10px; font-size: 13px; font-family: var(--font);
+  max-width: 320px;
+}
+.session-toolbar .tool { margin-left: auto; }
+.session-feed {
+  max-height: 480px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px;
+  padding-right: 4px;
+}
+.session-msg {
+  background: var(--bg-card); border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm); padding: 8px 12px;
+  font-size: 13px; line-height: 1.55;
+}
+.session-msg.role-user { border-left: 3px solid var(--info); }
+.session-msg.role-assistant { border-left: 3px solid var(--ok); }
+.session-head {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.session-role {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.4px; color: var(--text);
+  background: var(--bg-hover); border-radius: 4px; padding: 1px 7px;
+}
+.role-user .session-role { color: var(--info); }
+.role-assistant .session-role { color: var(--ok); }
+.session-ts { font-size: 11px; color: var(--text-faint); font-family: var(--mono); }
+.session-part { white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.part-thinking { color: var(--text-dim); font-style: italic; }
+.part-tool {
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  background: var(--bg-hover); border-radius: 6px; padding: 6px 8px;
+  margin-top: 4px; white-space: pre-wrap; word-break: break-all;
+}
+.session-msg.session-sys { background: transparent; border-style: dashed; padding: 3px 12px; }
+.session-sys-line { font-size: 11.5px; color: var(--text-faint); font-family: var(--mono); }
+.session-msg.session-raw { background: transparent; }
+.session-raw pre {
+  margin: 0; font-family: var(--mono); font-size: 12px;
+  color: var(--err); white-space: pre-wrap; word-break: break-all;
+}

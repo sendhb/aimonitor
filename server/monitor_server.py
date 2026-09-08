@@ -12,6 +12,8 @@ monitor_server.py — aimonitor 后端采集服务（零第三方依赖，Python
 - POST /api/ingest → Bearer token 鉴权（TASK-035）→ 限流（TASK-036）→ 授权范围/未注册/双 agent 冲突检查
   （TASK-036）后落库 ingest_state（TASK-034/035/036），并写历史快照（TASK-040：趋势即时反映推送）；
   请求体为 AIOS 通用遥测格式（file-oriented，TASK-042 与 aibase 组件 agent 零转换对接）
+  可选顶层 sessions 增量（TASK-073，契约 v1.1 = aibase TASK-104 agent 端）：按游标续传落库 +
+  GET /api/projects/:id/sessions 查询端点（task/file 分组 + 消息级行读取，前端轮询查看页）
 
 用法:
   python3 server/monitor_server.py [--port 3113] [--dev] [--quiet]
@@ -53,6 +55,7 @@ DEFAULT_EVENT_LIMIT = 10
 MAX_EVENT_LIMIT = 100
 
 EVENTS_RE = re.compile(r"^/api/projects/([^/]+)/events$")
+SESSIONS_RE = re.compile(r"^/api/projects/([^/]+)/sessions$")
 STATUS_RE = re.compile(r"^/api/register/([^/]+)/status$")
 APPROVE_RE = re.compile(r"^/api/register/([^/]+)/approve$")
 REJECT_RE = re.compile(r"^/api/register/([^/]+)/reject$")
@@ -65,6 +68,22 @@ CODES_REVOKE_RE = re.compile(r"^/api/register/codes/([^/]+)/revoke$")
 # 下行指令队列（TASK-035，AGENT-DOWNLINK-CONTRACT）
 DOWNLINK_RESULT_RE = re.compile(r"^/api/downlink/commands/(\d+)/result$")
 DOWNLINK_STATUS_RE = re.compile(r"^/api/downlink/commands/(\d+)$")
+
+# 下行指令端点（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0 §一）
+DOWNLINK_COMMANDS_RE = re.compile(r"^/api/downlink/commands$")
+DOWNLINK_COMMAND_ID_RE = re.compile(r"^/api/downlink/commands/([^/]+)$")
+DOWNLINK_PICKUP_RE = re.compile(r"^/api/downlink/pickup$")
+DOWNLINK_RESULT_RE = re.compile(r"^/api/downlink/commands/([^/]+)/result$")
+# 命令白名单（契约 §二：server 第一道闸；agent 侧独立枚举，不共享代码路径）
+DOWNLINK_COMMAND_NAMES = ("task_start", "autoloop_coder", "autoloop_reviewer")
+DOWNLINK_PICKUP_TIMEOUT_SECS = 90     # 契约 §三：> 2×poll_interval(10s)
+DOWNLINK_MAX_REDELIVERIES = 2         # pickup 超时重投 ≤2 次 → failed(human)
+DOWNLINK_DEFAULT_TIMEOUT_SECS = 1800  # 契约 §二：执行超时缺省
+DOWNLINK_MAX_TIMEOUT_SECS = 86400     # 保守上限 1 天，防滥用
+DOWNLINK_RESULT_MAX_LINES = 200       # 契约 §四：tail ≤200 行
+DOWNLINK_TERMINAL_STATUSES = ("done", "failed", "skipped")
+# §四 脱敏（server 侧独立实现，与 agent_downlink.SECRET_LINE_RE 各自维护）
+DOWNLINK_SECRET_LINE_RE = re.compile(r"authorization|bearer|token", re.IGNORECASE)
 
 # 告警派生（TASK-026，见 MONITOR-SPEC §4.6）：默认阈值与参与 task-stale 判定的非终态状态
 DEFAULT_BLOCKED_RATIO_THRESHOLD = 0.2
@@ -82,6 +101,8 @@ DOWNLINK_TAIL_MAX_LINES = 200
 DOWNLINK_TERMINAL_STATUSES = ("done", "failed", "skipped")
 # 注册审批存储（TASK-047）：默认库位置 data/registration.db
 REGISTRATION_DB_REL = ("data", "registration.db")
+# 下行指令存储（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0）：默认库位置 data/downlink.db
+DOWNLINK_DB_REL = ("data", "downlink.db")
 # ingest API（TASK-034，见 MONITOR-SPEC §3.1.3）：payload 上限，超限 413
 MAX_INGEST_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5MB（tasks+events 原文体量留足余量）
 # task 事件流（TASK-071，aimonitor 服务端消费）：agent 推送的 task-events.jsonl 增量
@@ -89,6 +110,19 @@ MAX_INGEST_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5MB（tasks+events 原文体量留
 # kit/tools/agent/agent_payload.py 的 MAX_TASK_EVENTS=200 对齐；cursor 为已确认推进点。
 MAX_TASK_EVENTS_INGEST = 200
 TASK_EVENTS_TABLE = "task_events"
+
+# session 日志增量（TASK-073，aibase TASK-104 契约 v1.1）：
+# - 单行字节上限与 agent 端 MAX_SESSION_LINE_BYTES 对齐：agent 发送前已截断，
+#   超限 = 契约违反，400 fail loud（FIND-003 同款：不静默截断再推进游标）
+# - 单文件行数滚动上限：长会话 MB 级 jsonl 逐轮续传，落库不封顶会无界增长；
+#   超限删最旧行（滚动窗口，查看页语义 = “最近 N 行”，丢最旧不影响实时性）
+# - 查询端点单次行数上限（查看页默认 200，够轮询一屏 + 后端响应体积可控）
+MAX_SESSION_LINE_BYTES = 64 * 1024
+SESSION_MAX_LINES_PER_FILE = 5000
+SESSION_QUERY_MAX_LINES = 1000
+SESSION_FILES_TABLE = "session_files"
+SESSION_LINES_TABLE = "session_lines"
+SESSION_STATE_TABLE = "session_state"
 # ingest 鉴权（TASK-035，见 MONITOR-SPEC §3.1.2）：config/agents.json（权限 600，gitignored）
 AGENTS_CONFIG_REL = ("config", "agents.json")
 # admin 密码（TASK-049，见 MONITOR-SPEC §3.2.5）：config/admin.json（权限 600，gitignored）
@@ -1042,6 +1076,38 @@ class IngestStore:
                 " event_json TEXT NOT NULL,"
                 " PRIMARY KEY (project_id, seq))"
             )
+            # TASK-073：session 日志增量三表（aibase TASK-104 契约 v1.1）
+            # - session_files：每文件接收状态（行数 + agent 字节游标 + 最后更新）。
+            #   last_offset 为 agent 端已确认送达的字节偏移（游标语义：只反映实际装入行，
+            #   outbox 不虚报）——幂等判定/重建重置/追平确认均以此为基准。
+            # - session_lines：逐行原文（line_no 严格递增 = 到达序；解析留待查询层，
+            #   损坏行由查询层宽松标注——与契约「agent 不解析不丢内容」对称）
+            # - session_state：项目级批标志（truncated = 最近一批有积压）+ 最近推送时间
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS " + SESSION_FILES_TABLE + " ("
+                " project_id TEXT NOT NULL,"
+                " task_id TEXT NOT NULL,"
+                " file_name TEXT NOT NULL,"
+                " line_count INTEGER NOT NULL DEFAULT 0,"
+                " last_offset INTEGER,"
+                " updated_at INTEGER NOT NULL,"
+                " PRIMARY KEY (project_id, task_id, file_name))"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS " + SESSION_LINES_TABLE + " ("
+                " project_id TEXT NOT NULL,"
+                " task_id TEXT NOT NULL,"
+                " file_name TEXT NOT NULL,"
+                " line_no INTEGER NOT NULL,"
+                " line_text TEXT NOT NULL,"
+                " PRIMARY KEY (project_id, task_id, file_name, line_no))"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS " + SESSION_STATE_TABLE + " ("
+                " project_id TEXT PRIMARY KEY,"
+                " truncated INTEGER NOT NULL DEFAULT 0,"
+                " last_push INTEGER NOT NULL)"
+            )
         except Exception:
             conn.close()
             raise
@@ -1159,6 +1225,30 @@ class IngestStore:
             finally:
                 conn.close()
 
+    def append_server_event(self, project_id, event):
+        """服务端生成事件追加（TASK-071 downlink.stale / downlink.result）。
+
+        沿用 task_events 表与 (project_id, seq) 主键：seq = MAX(seq)+1（服务端单调），
+        与 agent 推送事件同流读出（read_task_events 按 seq 降序）——契约 §四
+        「追加事件到该项目事件流（沿用现有事件机制）」。仅 agent 传输项目调用
+        （下行指令只指向 agent 条目）。
+        """
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) FROM " + TASK_EVENTS_TABLE
+                        + " WHERE project_id=?", (project_id,)).fetchone()
+                    seq = (row[0] or 0) + 1
+                    conn.execute(
+                        "INSERT INTO " + TASK_EVENTS_TABLE
+                        + " (project_id, seq, event_json) VALUES (?,?,?)",
+                        (project_id, seq,
+                         json.dumps(event, ensure_ascii=False, sort_keys=True)))
+            finally:
+                conn.close()
+
     def read_task_events(self, project_id, limit=10):
         """读取 task 事件流 → (count, cursor, items)。
 
@@ -1222,6 +1312,183 @@ class IngestStore:
                 conn.close()
         return [{"project_id": r[0], "payload": json.loads(r[1]),
                  "last_seen": r[2], "agent_id": r[3], "task_cursor": r[4]} for r in rows]
+
+    # ---------------- session 日志增量（TASK-073，aibase TASK-104 契约 v1.1） ----------------
+
+    def store_session_deltas(self, project_id, sessions):
+        """入库 session 日志增量（TASK-073）：逐文件续传 + 幂和对账 + 重建重置 + 滚动上限。
+
+        sessions 为 payload 顶层 sessions（dict，validate_ingest_payload 已校验）：
+        {items: [{task_id, files: [{name, lines: [原始行文本...]}]}], truncated: bool,
+         cursor: {"<TASK-ID>/<文件名>": 字节偏移}}
+
+        逐文件判定（agent 端游标语义：cursor 只反映实际装入行，推送成功后才持久化）：
+        - 无接收记录 → 新文件，从 line_no=1 追加；
+        - incoming < stored → agent 端文件重建/截断（游标归零重读）→ 删旧行重收
+          （宁重收不静默丢，契约「截断重建归零重读」对称）；
+        - incoming == stored → 纯重放（服务端已收、agent 未落游标）→ 幂等跳过；
+        - incoming > stored → 混合重推（重放+新增）或纯新增：以行内容前缀重叠对账，
+          找最大 k 使 stored 尾部 k 行 == lines 前 k 行，只补 lines[k:]。
+          覆盖「推送成功 → agent 崩溃未落游标 → 整批重推且文件已增长」窗口。
+
+        整批单事务：任何文件失败全部回滚（cursor 推进与行写入原子，不落「游标虚高
+        而行缺失」）；超 SESSION_MAX_LINES_PER_FILE 删最旧行（滚动窗口）。
+        session_state 每批刷新（truncated 批标志 + last_push），空 items（追平确认）也更新。
+        """
+        now = int(time.time())
+        items = sessions.get("items") or []
+        cursor_map = sessions.get("cursor") or {}
+        truncated = 1 if sessions.get("truncated") else 0
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    for entry in items:
+                        task_id = entry.get("task_id", "")
+                        for fentry in entry.get("files") or []:
+                            fname = fentry.get("name", "")
+                            lines = fentry.get("lines") or []
+                            incoming = cursor_map.get(f"{task_id}/{fname}")
+                            row = conn.execute(
+                                "SELECT line_count, last_offset FROM "
+                                + SESSION_FILES_TABLE
+                                + " WHERE project_id=? AND task_id=? AND file_name=?",
+                                (project_id, task_id, fname)).fetchone()
+                            if row is None:
+                                skip, reset, stored_count = False, False, 0
+                            else:
+                                stored_count, stored_off = row
+                                if (incoming is not None and stored_off is not None
+                                        and incoming < stored_off):
+                                    # 重建/截断：agent 游标倒退 → 归零重收
+                                    conn.execute(
+                                        "DELETE FROM " + SESSION_LINES_TABLE
+                                        + " WHERE project_id=? AND task_id=? AND file_name=?",
+                                        (project_id, task_id, fname))
+                                    skip, reset, stored_count = False, True, 0
+                                elif (incoming is not None and stored_off is not None
+                                        and incoming == stored_off):
+                                    # 纯重放：游标同位 → 幂等跳过（只刷新批标志/时间）
+                                    skip, reset = True, False
+                                else:
+                                    skip, reset = False, False
+                                if not skip and not reset and lines:
+                                    # 前缀重叠对账（混合重推）：找最大重叠 k，只补新行
+                                    tail = conn.execute(
+                                        "SELECT line_text FROM " + SESSION_LINES_TABLE
+                                        + " WHERE project_id=? AND task_id=? AND file_name=?"
+                                        " ORDER BY line_no DESC LIMIT ?",
+                                        (project_id, task_id, fname,
+                                         min(len(lines), stored_count))).fetchall()
+                                    tail = [r[0] for r in reversed(tail)]
+                                    k = 0
+                                    for cand in range(min(len(tail), len(lines)), 0, -1):
+                                        if tail[-cand:] == lines[:cand]:
+                                            k = cand
+                                            break
+                                    lines = lines[k:]
+                            if skip:
+                                continue
+                            # 插入基准 = MAX(line_no)（行号高水位只增不回退：滚动窗口删旧行
+                            # 后 line_count 归位，若用 count 作基准会撞 UNIQUE 主键）
+                            base = conn.execute(
+                                "SELECT COALESCE(MAX(line_no), 0) FROM "
+                                + SESSION_LINES_TABLE
+                                + " WHERE project_id=? AND task_id=? AND file_name=?",
+                                (project_id, task_id, fname)).fetchone()[0]
+                            for i, text in enumerate(lines):
+                                conn.execute(
+                                    "INSERT INTO " + SESSION_LINES_TABLE
+                                    + " (project_id, task_id, file_name, line_no, line_text)"
+                                    " VALUES (?,?,?,?,?)",
+                                    (project_id, task_id, fname, base + i + 1, text))
+                            # 滚动上限：行号高水位超出窗口则删最旧行（阈值基于 line_no，
+                            # 而非现存行数——行号只增不回退，用 count 会漏删）
+                            high = base + len(lines)
+                            if high > SESSION_MAX_LINES_PER_FILE:
+                                conn.execute(
+                                    "DELETE FROM " + SESSION_LINES_TABLE
+                                    + " WHERE project_id=? AND task_id=? AND file_name=?"
+                                    " AND line_no <= ?",
+                                    (project_id, task_id, fname,
+                                     high - SESSION_MAX_LINES_PER_FILE))
+                            new_count = conn.execute(
+                                "SELECT COUNT(*) FROM " + SESSION_LINES_TABLE
+                                + " WHERE project_id=? AND task_id=? AND file_name=?",
+                                (project_id, task_id, fname)).fetchone()[0]
+                            conn.execute(
+                                "INSERT INTO " + SESSION_FILES_TABLE
+                                + " (project_id, task_id, file_name, line_count,"
+                                " last_offset, updated_at) VALUES (?,?,?,?,?,?)"
+                                " ON CONFLICT(project_id, task_id, file_name) DO UPDATE SET"
+                                " line_count=excluded.line_count,"
+                                " last_offset=excluded.last_offset,"
+                                " updated_at=excluded.updated_at",
+                                (project_id, task_id, fname, new_count,
+                                 incoming, now))
+                    conn.execute(
+                        "INSERT INTO " + SESSION_STATE_TABLE
+                        + " (project_id, truncated, last_push) VALUES (?,?,?)"
+                        " ON CONFLICT(project_id) DO UPDATE SET"
+                        " truncated=excluded.truncated, last_push=excluded.last_push",
+                        (project_id, truncated, now))
+            finally:
+                conn.close()
+
+    def read_sessions_summary(self, project_id):
+        """读取项目 session 接收概览（TASK-073 查询端点）：task/file 分组 + 批标志。
+
+        返回 {project_id, truncated, last_push, tasks: [{task_id, files: [{name,
+        line_count, last_offset, updated_at}]}]}；无任何接收记录 → tasks=[]。
+        """
+        with self.lock:
+            conn = self._connect()
+            try:
+                files = conn.execute(
+                    "SELECT task_id, file_name, line_count, last_offset, updated_at"
+                    " FROM " + SESSION_FILES_TABLE
+                    + " WHERE project_id=? ORDER BY task_id, file_name",
+                    (project_id,)).fetchall()
+                st = conn.execute(
+                    "SELECT truncated, last_push FROM " + SESSION_STATE_TABLE
+                    + " WHERE project_id=?", (project_id,)).fetchone()
+            finally:
+                conn.close()
+        tasks = {}
+        for tid, fname, cnt, off, upd in files:
+            tasks.setdefault(tid, []).append(
+                {"name": fname, "line_count": cnt, "last_offset": off,
+                 "updated_at": upd})
+        return {
+            "project_id": project_id,
+            "truncated": bool(st[0]) if st is not None else False,
+            "last_push": st[1] if st is not None else None,
+            "tasks": [{"task_id": tid, "files": fs} for tid, fs in sorted(tasks.items())],
+        }
+
+    def read_session_lines(self, project_id, task_id, file_name, limit=200):
+        """读取单文件最近 limit 行（升序返回，行号连续）：[{line_no, text}...]。
+
+        limit ≤ 0 或非法 → 空列表；超 SESSION_QUERY_MAX_LINES 截到上限（响应体积可控）。
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 0  # 非法 fail-closed：端点层已 400 拦截，store 层防御不回落默认
+        limit = max(0, min(limit, SESSION_QUERY_MAX_LINES))
+        if not limit:
+            return []
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT line_no, line_text FROM " + SESSION_LINES_TABLE
+                    + " WHERE project_id=? AND task_id=? AND file_name=?"
+                    " ORDER BY line_no DESC LIMIT ?",
+                    (project_id, task_id, file_name, limit)).fetchall()
+            finally:
+                conn.close()
+        return [{"line_no": r[0], "text": r[1]} for r in reversed(rows)]
 
 
 class IngestRateLimiter:
@@ -2041,6 +2308,11 @@ class State:
         self.projects_path = projects_path or CONFIG_PATH
         # 注册码存储（TASK-048）：与 RegistrationStore 同一 DB
         self.enrollment = EnrollmentCodeStore(registration_db_path)
+        # 下行指令存储（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0）：
+        # 默认 <ROOT>/data/downlink.db，测试可注入临时路径；事件经 self.ingest 落 task_events
+        downlink_db_path = downlink_db_path or os.path.join(ROOT, *DOWNLINK_DB_REL)
+        self.downlink = DownlinkStore(downlink_db_path, ingest_store=self.ingest,
+                                      clock=rate_clock or time.time)
         # 注册端点限流（TASK-050）：全局限流，config.projects.json 顶层可配置
         self.register_limiter = IngestRateLimiter(
             config.get("register_rate_limit_per_minute", 60),
@@ -2177,6 +2449,22 @@ class State:
         self._log(f"后台轮询已启动（间隔 {interval}s）")
 
 
+def parse_session_line(line_no, text):
+    """解析一行 session jsonl（TASK-073 查看端点）：宽松语义，损坏行原样标注不丢弃。
+
+    契约「agent 不解析不丢内容」的对称面：服务端也不因解析失败丢行——
+    合法 JSON → {line_no, ok: True, type, data}；非法/非 dict → ok: False + 原文。
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {"line_no": line_no, "ok": False, "type": "raw", "text": text}
+    if isinstance(data, dict):
+        return {"line_no": line_no, "ok": True,
+                "type": str(data.get("type") or "unknown"), "data": data}
+    return {"line_no": line_no, "ok": True, "type": "raw", "data": data}
+
+
 def validate_ingest_payload(obj):
     """校验 POST /api/ingest 请求体 schema（TASK-034，MONITOR-SPEC §3.1.3）。
 
@@ -2300,6 +2588,59 @@ def validate_ingest_payload(obj):
             last_seq = seq
         if events and cursor is not None and cursor < last_seq:
             return f"cursor（{cursor}）小于批量最大 seq（{last_seq}），违反确认语义"
+
+    # TASK-073：session 日志增量（payload 顶层 sessions，aibase TASK-104 契约 v1.1）。
+    # 宽松语义：缺省 sessions = agent 未启用 session 流（v1.0 旧 payload 向后兼容，仍 200）。
+    # - items[]: 按 task 分组 [{task_id, files: [{name, lines: [原始 jsonl 行文本...]}]}]
+    # - truncated: bool（本轮有未送达积压，下轮续推）
+    # - cursor: {"<TASK-ID>/<文件名>": 字节偏移 ≥ 0}（本轮确认覆盖；空批追平时也携带）
+    # 单行 > MAX_SESSION_LINE_BYTES → 400 fail loud（agent 端已截断，超限 = 契约违反；
+    # 不静默收下——与 events 超批同款不变量：不落一条虚高游标认领的行）。
+    sessions = obj.get("sessions")
+    if sessions is not None:
+        if not isinstance(sessions, dict):
+            return "sessions 必须为对象"
+        items = sessions.get("items")
+        if items is not None:
+            if not isinstance(items, list):
+                return "sessions.items 必须为数组"
+            for i, entry in enumerate(items):
+                if not isinstance(entry, dict):
+                    return f"sessions.items[{i}] 必须为对象"
+                task_id = entry.get("task_id")
+                if not isinstance(task_id, str) or not task_id.strip():
+                    return f"sessions.items[{i}].task_id 必须为非空字符串"
+                files = entry.get("files")
+                if not isinstance(files, list):
+                    return f"sessions.items[{task_id}].files 必须为数组"
+                for j, fentry in enumerate(files):
+                    if not isinstance(fentry, dict):
+                        return f"sessions.items[{task_id}].files[{j}] 必须为对象"
+                    fname = fentry.get("name")
+                    if not isinstance(fname, str) or not fname.strip():
+                        return f"sessions.items[{task_id}].files[{j}].name 必须为非空字符串"
+                    lines = fentry.get("lines")
+                    if not isinstance(lines, list):
+                        return f"sessions.items[{task_id}].files[{fname}].lines 必须为数组"
+                    for k, line in enumerate(lines):
+                        if not isinstance(line, str):
+                            return f"sessions.items[{task_id}].files[{fname}].lines[{k}] 必须为字符串"
+                        if len(line.encode("utf-8")) > MAX_SESSION_LINE_BYTES:
+                            return (f"sessions.items[{task_id}].files[{fname}]"
+                                    f".lines[{k}] 单行超出字节上限"
+                                    f"（{MAX_SESSION_LINE_BYTES}），请 agent 端截断后再推")
+        truncated = sessions.get("truncated")
+        if truncated is not None and not isinstance(truncated, bool):
+            return "sessions.truncated 必须为布尔值"
+        session_cursor = sessions.get("cursor")
+        if session_cursor is not None:
+            if not isinstance(session_cursor, dict):
+                return "sessions.cursor 必须为对象（{\"<TASK-ID>/<文件名>\": 字节偏移}）"
+            for ckey, coff in session_cursor.items():
+                if not isinstance(ckey, str) or not ckey.strip():
+                    return "sessions.cursor 键必须为非空字符串（<TASK-ID>/<文件名>）"
+                if isinstance(coff, bool) or not isinstance(coff, int) or coff < 0:
+                    return f"sessions.cursor[{ckey}] 必须为非负整数（字节偏移）"
     return None
 
 
@@ -2559,15 +2900,323 @@ def apply_task_filters(tasks, filters):
     return out
 
 
+# ---------------- 下行指令存储（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0 §二/§三/§五） ----------------
+
+def _downlink_iso(epoch):
+    """epoch → ISO8601 UTC（契约示例格式 2026-08-30T12:00:00Z）。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _downlink_sanitize_tail(text):
+    """回报 tail 清洗（契约 §四）：剔除含 Authorization/Bearer/token 字样的行 + ≤200 行。
+
+    agent 侧已脱敏一次，server 侧独立重做（纵深防御，两套实现互不依赖）；
+    仅按行处理，超限截断不报错（回报尾部本就是截断语义）。
+    """
+    lines = [ln for ln in str(text).splitlines()
+             if not DOWNLINK_SECRET_LINE_RE.search(ln)]
+    return "\n".join(lines[:DOWNLINK_RESULT_MAX_LINES])
+
+
+class DownlinkStore:
+    """下行指令队列存储层：stdlib sqlite3，data/downlink.db（不入被监控项目）。
+
+    - 表 command 一行一指令；meta.next_id 计数器 → command_id（dl-NNNNNN）与 seq
+      同源单调，重启不回退（契约 §二）；
+    - dedup 幂等（契约 §三 R2-001 ③①）：dedup_key 部分唯一索引仅约束在途
+      （queued/running）——终态后同 key 可再入队（新一轮派发）；
+    - 状态机：queued ──pickup──▶ running ──result──▶ done|failed|skipped；
+      pickup 超时（90s）重投 ≤2 次 → failed(human)；执行超时 → failed（转人工）；
+      回收惰性：pickup 超时仅在**对应 token 白名单项目的 pickup 调用内**扫描
+      （busy 窗口暂停语义：执行中的 agent 不调 pickup，窗口自然不推进——契约 §三
+      R2-001 与 agent_downlink「执行期间跳过拾取」配套）；执行超时为全局兜底，
+      在 pickup/status 调用内均扫描；
+    - 服务端事件（downlink.stale / downlink.result）经 IngestStore.append_server_event
+      落入该项目 task_events 流（契约 §四「沿用现有事件机制」）。
+    """
+
+    _COLS = ("command_id, seq, dedup_key, project_id, name, args_json, timeout_secs,"
+             " created_by, created_at, status, deliveries, redeliveries,"
+             " picked_at, picked_by, result_json, finished_at")
+
+    def __init__(self, db_path, ingest_store=None, clock=None):
+        self.db_path = db_path
+        self.ingest_store = ingest_store
+        self.lock = threading.Lock()
+        self._clock = clock or time.time
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._connect().close()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS command ("
+            " command_id TEXT PRIMARY KEY,"
+            " seq INTEGER NOT NULL,"
+            " dedup_key TEXT NOT NULL,"
+            " project_id TEXT NOT NULL,"
+            " name TEXT NOT NULL,"
+            " args_json TEXT NOT NULL,"
+            " timeout_secs INTEGER NOT NULL,"
+            " created_by TEXT NOT NULL,"
+            " created_at TEXT NOT NULL,"
+            " status TEXT NOT NULL"
+            "   CHECK (status IN ('queued','running','done','failed','skipped')),"
+            " deliveries INTEGER NOT NULL DEFAULT 0,"
+            " redeliveries INTEGER NOT NULL DEFAULT 0,"
+            " picked_at TEXT,"
+            " picked_by TEXT,"
+            " picked_epoch REAL,"
+            " pickup_deadline REAL,"
+            " result_json TEXT,"
+            " finished_at TEXT)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_command_project_status"
+            " ON command(project_id, status)")
+        # dedup 闸（契约 §三 ③①）：部分唯一索引仅约束在途状态
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_command_dedup_active"
+            " ON command(dedup_key) WHERE status IN ('queued','running')")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        return conn
+
+    def _next_id(self, conn):
+        """command_id 单调计数器（meta 持久化，重启不回退）。"""
+        row = conn.execute("SELECT value FROM meta WHERE key='next_id'").fetchone()
+        n = int(row[0]) if row else 1
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('next_id', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(n + 1),))
+        return n
+
+    @staticmethod
+    def _to_dict(row):
+        (cid, seq, dedup, proj, name, args_json, timeout, by, at, status,
+         deliveries, redeliveries, picked_at, picked_by, result_json,
+         finished_at) = row
+        d = {"command_id": cid, "seq": seq, "dedup_key": dedup,
+             "project_id": proj,
+             "command": {"name": name, "args": json.loads(args_json)},
+             "timeout_secs": timeout, "created_by": by, "created_at": at,
+             "status": status, "deliveries": deliveries,
+             "redeliveries": redeliveries, "picked_at": picked_at,
+             "picked_by": picked_by, "finished_at": finished_at}
+        if result_json:
+            d["result"] = json.loads(result_json)
+        return d
+
+    def enqueue(self, project_id, dedup_key, name, args, timeout_secs, created_by):
+        """入队 → (指令 dict, reused)；409 语义（同 key 在途 → 复用）在此归一。"""
+        now = self._clock()
+        now_iso = _downlink_iso(now)
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    row = conn.execute(
+                        "SELECT command_id FROM command"
+                        " WHERE dedup_key=? AND status IN ('queued','running')",
+                        (dedup_key,)).fetchone()
+                    if row:
+                        full = conn.execute(
+                            "SELECT " + self._COLS + " FROM command"
+                            " WHERE command_id=?", (row[0],)).fetchone()
+                        return self._to_dict(full), True
+                    n = self._next_id(conn)
+                    cid = "dl-%06d" % n
+                    conn.execute(
+                        "INSERT INTO command (command_id, seq, dedup_key, project_id,"
+                        " name, args_json, timeout_secs, created_by, created_at, status,"
+                        " deliveries, redeliveries, picked_at, picked_by, picked_epoch,"
+                        " pickup_deadline, result_json, finished_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,'0','0',NULL,NULL,NULL,?,NULL,NULL)",
+                        (cid, n, dedup_key, project_id, name,
+                         json.dumps(list(args or []), ensure_ascii=False),
+                         int(timeout_secs), created_by, now_iso, "queued",
+                         now + DOWNLINK_PICKUP_TIMEOUT_SECS))
+                    full = conn.execute(
+                        "SELECT " + self._COLS + " FROM command WHERE command_id=?",
+                        (cid,)).fetchone()
+                    return self._to_dict(full), False
+            finally:
+                conn.close()
+
+    def _sweep_running_locked(self, conn, now, now_iso):
+        """执行超时兜底（全局安全）：running 且 picked_epoch+timeout_secs < now
+        → failed（转人工，无 exit_code → dispatcher 侧 rc=1）+ downlink.stale 事件。"""
+        rows = conn.execute(
+            "SELECT command_id, project_id, picked_epoch, timeout_secs FROM command"
+            " WHERE status='running' AND picked_epoch IS NOT NULL"
+            " AND picked_epoch + timeout_secs < ?", (now,)).fetchall()
+        events = []
+        for cid, proj, picked, _t in rows:
+            result = {"status": "failed", "exit_code": None,
+                      "reason": "exec-timeout", "finished_at": now_iso}
+            conn.execute(
+                "UPDATE command SET status='failed', result_json=?, finished_at=?"
+                " WHERE command_id=?",
+                (json.dumps(result, ensure_ascii=False, sort_keys=True),
+                 now_iso, cid))
+            events.append({"ts": now_iso, "ev": "downlink.stale",
+                           "command_id": cid, "project_id": proj,
+                           "reason": "exec-timeout"})
+        return events
+
+    def _sweep_pickup_timeout_locked(self, conn, allowed_projects, now, now_iso):
+        """pickup 超时（仅本 token 白名单项目，busy 暂停语义）：queued 且过 90s 窗口
+        → 重投（redeliveries+1、seq+1、窗口重置）≤2 次 → failed(human)+事件。"""
+        ph = ",".join("?" for _ in allowed_projects)
+        rows = conn.execute(
+            "SELECT command_id, project_id, redeliveries FROM command"
+            " WHERE status='queued' AND pickup_deadline < ?"
+            f" AND project_id IN ({ph})", (now,) + tuple(allowed_projects)).fetchall()
+        events = []
+        for cid, proj, redeliveries in rows:
+            if redeliveries < DOWNLINK_MAX_REDELIVERIES:
+                conn.execute(
+                    "UPDATE command SET redeliveries=redeliveries+1, seq=seq+1,"
+                    " pickup_deadline=? WHERE command_id=?",
+                    (now + DOWNLINK_PICKUP_TIMEOUT_SECS, cid))
+            else:
+                result = {"status": "failed", "exit_code": None,
+                          "reason": "pickup-timeout", "finished_at": now_iso}
+                conn.execute(
+                    "UPDATE command SET status='failed', result_json=?, finished_at=?"
+                    " WHERE command_id=?",
+                    (json.dumps(result, ensure_ascii=False, sort_keys=True),
+                     now_iso, cid))
+                events.append({"ts": now_iso, "ev": "downlink.stale",
+                               "command_id": cid, "project_id": proj,
+                               "reason": "pickup-timeout"})
+        return events
+
+    def pickup(self, agent_id, allowed_projects):
+        """拾取（契约 §三）：惰性回收 → 白名单内最旧 queued → running。无 → None。"""
+        now = self._clock()
+        now_iso = _downlink_iso(now)
+        events = []
+        cmd = None
+        row = None
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    events = self._sweep_running_locked(conn, now, now_iso)
+                    if allowed_projects:
+                        events += self._sweep_pickup_timeout_locked(
+                            conn, allowed_projects, now, now_iso)
+                        ph = ",".join("?" for _ in allowed_projects)
+                        row = conn.execute(
+                            "SELECT command_id FROM command WHERE status='queued'"
+                            f" AND project_id IN ({ph})"
+                            " ORDER BY created_at ASC LIMIT 1",
+                            tuple(allowed_projects)).fetchone()
+                    if row is not None:
+                        conn.execute(
+                            "UPDATE command SET status='running', picked_at=?,"
+                            " picked_by=?, picked_epoch=?, deliveries=deliveries+1"
+                            " WHERE command_id=?",
+                            (now_iso, agent_id, now, row[0]))
+                        full = conn.execute(
+                            "SELECT " + self._COLS + " FROM command"
+                            " WHERE command_id=?", (row[0],)).fetchone()
+                        cmd = self._to_dict(full)
+            finally:
+                conn.close()
+        for ev in events:
+            if self.ingest_store is not None:
+                self.ingest_store.append_server_event(ev["project_id"], ev)
+        return cmd
+
+    def get(self, command_id):
+        """状态轮询（契约 §一）：附带执行超时兜底扫描；未知 → None。"""
+        now = self._clock()
+        now_iso = _downlink_iso(now)
+        events = []
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    events = self._sweep_running_locked(conn, now, now_iso)
+                    row = conn.execute(
+                        "SELECT " + self._COLS + " FROM command WHERE command_id=?",
+                        (command_id,)).fetchone()
+                    cmd = self._to_dict(row) if row else None
+            finally:
+                conn.close()
+        for ev in events:
+            if self.ingest_store is not None:
+                self.ingest_store.append_server_event(ev["project_id"], ev)
+        return cmd
+
+    def report_result(self, command_id, report):
+        """回报（契约 §四/§五）→ 'ok' | 'already-terminal' | None(未知)。
+
+        终态落库 + downlink.result 事件（提交后追加，事件失败不影响终态权威）；
+        已终态（含双 sweep 转的 failed）→ 409 幂等忽略语义。
+        """
+        now = self._clock()
+        status = report.get("status")
+        result = {"status": status, "exit_code": report.get("exit_code"),
+                  "stdout_tail": _downlink_sanitize_tail(report.get("stdout_tail") or ""),
+                  "stderr_tail": _downlink_sanitize_tail(report.get("stderr_tail") or ""),
+                  "finished_at": report.get("finished_at") or _downlink_iso(now)}
+        with self.lock:
+            conn = self._connect()
+            try:
+                with conn:
+                    row = conn.execute(
+                        "SELECT status, project_id FROM command WHERE command_id=?",
+                        (command_id,)).fetchone()
+                    if row is None:
+                        return None
+                    proj, old_status = row[1], row[0]
+                    if old_status in DOWNLINK_TERMINAL_STATUSES:
+                        return "already-terminal"
+                    conn.execute(
+                        "UPDATE command SET status=?, result_json=?, finished_at=?"
+                        " WHERE command_id=?",
+                        (status, json.dumps(result, ensure_ascii=False,
+                                            sort_keys=True),
+                         result["finished_at"], command_id))
+            finally:
+                conn.close()
+        if self.ingest_store is not None:
+            self.ingest_store.append_server_event(proj, {
+                "ts": result["finished_at"], "ev": "downlink.result",
+                "command_id": command_id, "project_id": proj,
+                "status": status, "exit_code": result["exit_code"]})
+        return "ok"
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     state = None
     static_dir = None
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
+        m = DOWNLINK_PICKUP_RE.match(path)
+        if m:
+            agent_id = self._downlink_gate()
+            if agent_id:
+                self._downlink_pickup(agent_id)
+            return
+        m = DOWNLINK_COMMAND_ID_RE.match(path)
+        if m:
+            agent_id = self._downlink_gate()
+            if agent_id:
+                self._downlink_status(m.group(1))
+            return
         m = EVENTS_RE.match(path)
         if m:
             self._events(m.group(1), query)
+            return
+        m = SESSIONS_RE.match(path)
+        if m:
+            self._sessions(m.group(1), query)
             return
         m = STATUS_RE.match(path)
         if m:
@@ -2643,6 +3292,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/register":
             self._register()
             return
+        m = DOWNLINK_RESULT_RE.match(path)
+        if m:
+            agent_id = self._downlink_gate()
+            if agent_id:
+                self._downlink_result(m.group(1), agent_id)
+            return
+        m = DOWNLINK_COMMANDS_RE.match(path)
+        if m:
+            agent_id = self._downlink_gate()
+            if agent_id:
+                self._downlink_enqueue(agent_id)
+            return
         if path != "/api/ingest":
             self._json_error(404, "未找到端点")
             return
@@ -2658,6 +3319,146 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._json_error(429, "请求过于频繁，请稍后重试")
             return
         self._ingest(agent_id)
+
+    # ---------------- 下行指令端点（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0） ----------------
+
+    def _downlink_gate(self):
+        """下行端点共用前置（契约 §一）：Bearer 鉴权（401）→ 每 agent 限流（429）。
+
+        与 /api/ingest 同序：先鉴权再限流再读体；返回 agent 身份（str）或 None
+        （错误响应已写，调用方直接 return）。
+        """
+        token = extract_bearer_token(self.headers.get("Authorization", ""))
+        agent_id = resolve_agent_id(ApiHandler.state.agents, token)
+        if agent_id is None:
+            # 不区分缺失/错误 token，不泄露任何队列信息（同 ingest 401 语义）
+            self._json_error(401, "鉴权失败")
+            return None
+        if not ApiHandler.state.rate_limiter.allow(agent_id):
+            self._json_error(429, "请求过于频繁，请稍后重试")
+            return None
+        return agent_id
+
+    def _downlink_enqueue(self, agent_id):
+        """POST /api/downlink/commands（契约 §一/§二/§五）：写入侧双闸第一道。
+
+        闸序：schema 400 → command.name 白名单 400 → 注册表 + agent 传输条目 400
+        → dedup 在途 409（复用既有 command_id）→ 200 入队。
+        """
+        data, err = self._read_body()
+        if err:
+            self._json_error(413, err)
+            return
+        try:
+            body = json.loads((data or b"").decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._json_error(400, "body 必须是合法 JSON")
+            return
+        if not isinstance(body, dict):
+            self._json_error(400, "body 必须是 JSON 对象")
+            return
+        project_id = body.get("project_id")
+        dedup_key = body.get("dedup_key")
+        command = body.get("command")
+        if not (isinstance(project_id, str) and project_id):
+            self._json_error(400, "project_id 必须是非空字符串")
+            return
+        if not (isinstance(dedup_key, str) and dedup_key):
+            self._json_error(400, "dedup_key 必须是非空字符串")
+            return
+        if not isinstance(command, dict):
+            self._json_error(400, "command 必须是对象")
+            return
+        name = command.get("name")
+        args = command.get("args")
+        if name not in DOWNLINK_COMMAND_NAMES:
+            self._json_error(400, "command.name 不在白名单: "
+                             + ", ".join(DOWNLINK_COMMAND_NAMES))
+            return
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            self._json_error(400, "command.args 必须是字符串数组")
+            return
+        timeout_secs = body.get("timeout_secs", DOWNLINK_DEFAULT_TIMEOUT_SECS)
+        if (isinstance(timeout_secs, bool) or not isinstance(timeout_secs, int)
+                or timeout_secs <= 0 or timeout_secs > DOWNLINK_MAX_TIMEOUT_SECS):
+            self._json_error(400, "timeout_secs 必须是 1.."
+                             f"{DOWNLINK_MAX_TIMEOUT_SECS} 的整数")
+            return
+        proj = next((p for p in ApiHandler.state.config.get("projects", [])
+                     if p.get("id") == project_id), None)
+        if proj is None or proj.get("transport", "local") != "agent":
+            # 写入侧闸（契约 §一/§五）：未注册 / 非 agent 传输条目 → 400 不入队
+            self._json_error(400, "project 未注册或非 agent 传输条目")
+            return
+        cmd, reused = ApiHandler.state.downlink.enqueue(
+            project_id, dedup_key, name, args, timeout_secs, created_by=agent_id)
+        if reused:
+            # 409 也带 command_id（dispatcher enqueue 防双派依赖它，契约 §五）
+            self._json_error(409, "dedup_key 在途，复用既有指令",
+                             extra={"command_id": cmd["command_id"]})
+            return
+        self._json({"command_id": cmd["command_id"], "seq": cmd["seq"]})
+
+    def _downlink_pickup(self, agent_id):
+        """GET /api/downlink/pickup（契约 §三）：拾取侧第二道闸——
+        只下发该 token 白名单内项目的指令；无 → {"command": null}（等价队列为空）。"""
+        allowed = authorized_projects(ApiHandler.state.agents, agent_id)
+        cmd = ApiHandler.state.downlink.pickup(agent_id, allowed)
+        self._json({"command": cmd})
+
+    def _downlink_status(self, command_id):
+        """GET /api/downlink/commands/{id}（契约 §一）：dispatcher 轮询读回。"""
+        cmd = ApiHandler.state.downlink.get(command_id)
+        if cmd is None:
+            self._json_error(404, "指令不存在")
+            return
+        self._json({"command": cmd})
+
+    def _downlink_result(self, command_id, agent_id):
+        """POST /api/downlink/commands/{id}/result（契约 §四/§五）。
+
+        闸序：404 未知 → 已终态 409（幂等忽略）→ 非 picker 403（纵深防御）
+        → report schema 400 → 终态落库 + downlink.result 事件 → 200。
+        """
+        cmd = ApiHandler.state.downlink.get(command_id)
+        if cmd is None:
+            self._json_error(404, "指令不存在")
+            return
+        if cmd["status"] in DOWNLINK_TERMINAL_STATUSES:
+            self._json_error(409, "already-terminal")
+            return
+        if cmd.get("picked_by") != agent_id:
+            self._json_error(403, "非拾取者不可回报")
+            return
+        data, err = self._read_body()
+        if err:
+            self._json_error(413, err)
+            return
+        try:
+            report = json.loads((data or b"").decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._json_error(400, "body 必须是合法 JSON")
+            return
+        if not isinstance(report, dict) or report.get("status") not in DOWNLINK_TERMINAL_STATUSES:
+            self._json_error(400, "status 必须是 done|failed|skipped")
+            return
+        exit_code = report.get("exit_code")
+        if exit_code is not None and (isinstance(exit_code, bool)
+                                      or not isinstance(exit_code, int)):
+            self._json_error(400, "exit_code 必须是整数或 null")
+            return
+        for k in ("stdout_tail", "stderr_tail"):
+            if report.get(k) is not None and not isinstance(report[k], str):
+                self._json_error(400, f"{k} 必须是字符串或 null")
+                return
+        res = ApiHandler.state.downlink.report_result(command_id, report)
+        if res == "already-terminal":
+            self._json_error(409, "already-terminal")
+            return
+        if res is None:
+            self._json_error(404, "指令不存在")
+            return
+        self._json({"ok": True})
 
     def _read_body(self):
         """读取请求体；返回 (data, None) 或 (None, 413 错误消息)。
@@ -2861,6 +3662,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 print(f"[{datetime.now().strftime('%F %T')}] task 事件落库失败 "
                       f"project_id={project_id}: {type(e).__name__}: {e}", file=sys.stderr)
                 self._json_error(500, "task 事件落库失败")
+                return
+        # TASK-073：session 日志增量落库（aibase TASK-104 契约 v1.1）。与 task 事件同款：
+        # 落库失败 500（不 200）——agent 端游标推进以「服务端确认」为前提，静默丢批 =
+        # 数据永久丢失；files 快照 / task 事件 / session 增量三者分表，互不影响既有语义。
+        sessions = obj.get("sessions")
+        if sessions is not None:
+            try:
+                ApiHandler.state.ingest.store_session_deltas(project_id, sessions)
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%F %T')}] session 日志落库失败 "
+                      f"project_id={project_id}: {type(e).__name__}: {e}", file=sys.stderr)
+                self._json_error(500, "session 日志落库失败")
                 return
         # TASK-040：ingest 到达 → 立即写 HistoryStore 快照（趋势即时反映推送；/api/history 对
         # agent 项目不回归）。best-effort：失败不影响 ingest 200——推送已落库 ingest_state，
@@ -3551,6 +4364,89 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "cursor": tcursor,
                 "events": tevents,
             },
+        })
+
+    def _sessions(self, project_id, query):
+        """GET /api/projects/<id>/sessions（TASK-073，前端轮询查看页数据源）。
+
+        项目未注册 → 404。两种视图（单端点，参数分派）：
+        - 无 task → 概览：{project, generated_at, truncated, last_push, tasks:
+          [{task_id, files: [{name, line_count, last_offset, updated_at}]}]}；
+          可选 task 过滤（file 缺省时仅返回该 task 的文件列表）。
+        - task+file → 行视图：{project, task, file, line_count, last_offset,
+          truncated, limit, lines: [{line_no, ok, type, data|text}]}——最近 limit 行
+          升序，逐行宽松 JSON 解析（损坏行 ok=false 原样标注，不丢弃）。
+        limit 默认 200、(0, SESSION_QUERY_MAX_LINES] 正整数，非法 → 400。
+        前端轮询（默认 5s，消息级粒度 + agent 30s 推送周期下满足 ≤10s 级感知；
+        SSE 增益有限，选型决策见任务卡备注）。
+        """
+        proj = next((p for p in ApiHandler.state.config.get("projects", [])
+                     if p.get("id") == project_id), None)
+        if proj is None:
+            self._json_error(404, f"项目不存在: {project_id}")
+            return
+        params = parse_qs(query)
+        task = (params.get("task") or [None])[0]
+        fname = (params.get("file") or [None])[0]
+        limit = 200
+        raw = (params.get("limit") or [None])[0]
+        if raw is not None:
+            try:
+                limit = float(raw)
+            except ValueError:
+                self._json_error(400, "limit 必须为数字")
+                return
+            if not math.isfinite(limit) or limit <= 0 or limit > SESSION_QUERY_MAX_LINES:
+                self._json_error(400, f"limit 超出范围 (0, {SESSION_QUERY_MAX_LINES}]")
+                return
+            if not limit.is_integer():
+                self._json_error(400, "limit 必须为整数")
+                return
+            limit = int(limit)
+        try:
+            summary = ApiHandler.state.ingest.read_sessions_summary(project_id)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%F %T')}] session 概览读取失败 "
+                  f"project_id={project_id}: {type(e).__name__}: {e}", file=sys.stderr)
+            self._json_error(500, "session 概览读取失败")
+            return
+        if task is None:
+            self._json({"project": project_id, "generated_at": time.time(),
+                        "truncated": summary["truncated"],
+                        "last_push": summary["last_push"],
+                        "tasks": summary["tasks"]})
+            return
+        tasks = {t["task_id"]: t for t in summary["tasks"]}
+        if task not in tasks:
+            self._json({"project": project_id, "task": task, "generated_at": time.time(),
+                        "truncated": summary["truncated"], "files": []})
+            return
+        files = tasks[task]["files"]
+        if fname is None:
+            self._json({"project": project_id, "task": task,
+                        "generated_at": time.time(),
+                        "truncated": summary["truncated"], "files": files})
+            return
+        meta = next((f for f in files if f["name"] == fname), None)
+        try:
+            raw_lines = ApiHandler.state.ingest.read_session_lines(
+                project_id, task, fname, limit)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%F %T')}] session 行读取失败 "
+                  f"project_id={project_id}: {type(e).__name__}: {e}", file=sys.stderr)
+            self._json_error(500, "session 行读取失败")
+            return
+        self._json({
+            "project": project_id,
+            "task": task,
+            "file": fname,
+            "line_count": meta["line_count"] if meta is not None else 0,
+            "last_offset": meta["last_offset"] if meta is not None else None,
+            "updated_at": meta["updated_at"] if meta is not None else None,
+            "truncated": summary["truncated"],
+            "limit": limit,
+            "generated_at": time.time(),
+            "lines": [parse_session_line(r["line_no"], r["text"]) for r in raw_lines],
         })
 
     def _static(self):

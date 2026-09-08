@@ -40,6 +40,10 @@
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="3.5" cy="8" r="1.6"/><circle cx="8" cy="4" r="1.6"/><circle cx="12.5" cy="8" r="1.6"/><circle cx="8" cy="12" r="1.6"/><path d="M4.8 6.8 6.6 5M6.6 11 4.8 9.2M9.4 5l1.8 1.8M9.4 11l1.8-1.8"/></svg>
       <span class="t">执行流</span>
     </button>
+    <button class="nav-item" data-nav="sessions">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 2.5h10v11H3z"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3"/></svg>
+      <span class="t">Session 日志</span> <span class="n" id="nav-session-count"></span>
+    </button>
     <button class="nav-item" data-nav="trend">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 8.5 6 4l3 3 5-5"/><path d="M11 2h3v3"/></svg>
       <span class="t">趋势</span>
@@ -276,6 +280,24 @@
         </div>
       </div>
       <div id="trend-empty" class="trend-placeholder hidden">暂无历史数据（等待轮询采样）</div>
+    </section>
+
+    <!-- Session 日志（TASK-073：agent 推送 session 增量 → /api/projects/:id/sessions，前端轮询） -->
+    <section class="panel" id="sessions-panel">
+      <div class="panel-head">
+        <h3>Session 日志</h3>
+        <span class="tool">
+          <label class="session-live"><input type="checkbox" id="session-live-toggle" checked> 实时（5s）</label>
+        </span>
+      </div>
+      <div class="session-toolbar">
+        <select id="session-task"><option value="">选择任务…</option></select>
+        <select id="session-file"><option value="">选择文件…</option></select>
+        <span id="session-meta" class="tool"></span>
+      </div>
+      <div id="session-feed" class="session-feed">
+        <div class="trend-placeholder">暂无 session 数据（agent 推送 session 增量后显示）</div>
+      </div>
     </section>
 
     <div class="cols">

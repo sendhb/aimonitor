@@ -25,7 +25,9 @@
     regCodes: null,          // 最近一次 /api/register/codes 响应
     regCodesTab: "queue",   // 当前子 tab：queue / codes
     regCodePendingRevoke: null, // 待吊销的 code
-    regCodeGenPending: false    // TASK-057: 生成请求在途（F3 REVIEW：Enter 防重复）
+    regCodeGenPending: false, // TASK-057: 生成请求在途（F3 REVIEW：Enter 防重复）
+    // TASK-073: Session 日志查看页（前端轮询，消息级）
+    session: { projectId: null, summary: null, task: null, file: null, lines: null, timer: null }
   };
 
   var els = {
@@ -59,6 +61,13 @@
     trendEmpty: document.getElementById("trend-empty"),
     trendCompletion: document.getElementById("trend-completion"),
     trendEvent: document.getElementById("trend-event"),
+    // TASK-073: Session 日志
+    sessionTask: document.getElementById("session-task"),
+    sessionFile: document.getElementById("session-file"),
+    sessionMeta: document.getElementById("session-meta"),
+    sessionFeed: document.getElementById("session-feed"),
+    sessionLiveToggle: document.getElementById("session-live-toggle"),
+    navSessionCount: document.getElementById("nav-session-count"),
     trendCompletionMeta: document.getElementById("trend-completion-meta"),
     trendEventMeta: document.getElementById("trend-event-meta"),
     focus: document.getElementById("focus"),
@@ -1987,6 +1996,7 @@
     overview: null,       // 滚动到顶部
     tasks: "tasks-panel",
     exec: "exec-panel",
+    sessions: "sessions-panel",  // TASK-073: Session 日志查看页
     trend: "trend-panel",
     alerts: "alerts",
     registration: "registration-page"
@@ -2060,6 +2070,12 @@
           showMainContent(true);
           stopRegPolling();
           scrollToSection(NAV_SECTION[key] || null);
+          // TASK-073: Session 页进入即加载 + 轮询；离开即停（不产生后台流量）
+          if (key === "sessions") {
+            startSessionPolling();
+          } else {
+            stopSessionPolling();
+          }
         }
       });
     }
@@ -2114,8 +2130,223 @@
     timer = setTimeout(refresh, state.pollMs);
   }
 
+  // —— Session 日志（TASK-073：agent 推送 session 增量 → /api/projects/:id/sessions；
+  //    消息级粒度 + agent 默认 30s 推送周期，前端 5s 轮询满足 ≤10s 级感知；
+  //    SSE 增益有限故选轮询——选型决策见任务卡备注与 aibase TASK-104 评估结论） ——
+
+  function sessionUrl() {
+    return "/api/projects/" + encodeURIComponent(state.currentProjectId) + "/sessions";
+  }
+
+  function fillSessionSelect(sel, placeholder, items, current) {
+    sel.innerHTML = "";
+    var ph = document.createElement("option");
+    ph.value = ""; ph.textContent = placeholder;
+    sel.appendChild(ph);
+    items.forEach(function (it) {
+      var o = document.createElement("option");
+      o.value = it.v; o.textContent = it.label;
+      if (it.v === current) o.selected = true;
+      sel.appendChild(o);
+    });
+  }
+
+  function sessionTotalLines(tasks) {
+    return tasks.reduce(function (n, t) {
+      return n + t.files.reduce(function (m, f) { return m + f.line_count; }, 0);
+    }, 0);
+  }
+
+  function loadSessions() {
+    var pid = state.currentProjectId;
+    if (!pid) return;
+    fetch(sessionUrl(), { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (data) {
+        if (state.currentProjectId !== pid) return; // 项目已切换，丢弃防串台
+        var projectChanged = state.session.projectId !== pid;
+        state.session.projectId = pid;
+        state.session.summary = data;
+        if (projectChanged) { state.session.task = null; state.session.file = null; }
+        var tasks = data.tasks || [];
+        fillSessionSelect(els.sessionTask, "选择任务…",
+          tasks.map(function (t) {
+            return { v: t.task_id,
+                     label: t.task_id + "（" + sessionTotalLines([t]) + " 行）" };
+          }), state.session.task);
+        var cur = null;
+        for (var i = 0; i < tasks.length; i++) {
+          if (tasks[i].task_id === state.session.task) cur = tasks[i];
+        }
+        var files = cur ? cur.files : [];
+        if (!state.session.file && files.length === 1) state.session.file = files[0].name;
+        fillSessionSelect(els.sessionFile, "选择文件…",
+          files.map(function (f) {
+            return { v: f.name, label: f.name + "（" + f.line_count + " 行）" };
+          }), state.session.file);
+        els.navSessionCount.textContent = tasks.length ? String(sessionTotalLines(tasks)) : "";
+        if (state.session.task && state.session.file) {
+          loadSessionLines();
+        } else {
+          state.session.lines = null;
+          renderSessionPlaceholder("选择任务与文件查看会话内容");
+        }
+      })
+      .catch(function (e) {
+        renderSessionPlaceholder("获取 sessions 失败: " + e.message);
+      });
+  }
+
+  function loadSessionLines() {
+    var pid = state.currentProjectId;
+    var q = sessionUrl() + "?task=" + encodeURIComponent(state.session.task) +
+            "&file=" + encodeURIComponent(state.session.file) + "&limit=200";
+    fetch(q, { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (data) {
+        if (state.currentProjectId !== pid) return;
+        state.session.lines = data;
+        renderSessionFeed(data);
+      })
+      .catch(function (e) {
+        renderSessionPlaceholder("获取 session 行失败: " + e.message);
+      });
+  }
+
+  function renderSessionPlaceholder(msg) {
+    els.sessionFeed.innerHTML = "";
+    var d = document.createElement("div");
+    d.className = "trend-placeholder"; d.textContent = msg;
+    els.sessionFeed.appendChild(d);
+    els.sessionMeta.textContent = "";
+  }
+
+  function sessionPartBody(p) {
+    if (p == null) return "";
+    if (typeof p === "string") return p;
+    if (p.type === "toolCall") {
+      var args = p.arguments || p.input || p.args || p.payload;
+      var body = args ? JSON.stringify(args) : "";
+      if (body.length > 500) body = body.slice(0, 500) + "…[truncated]";
+      return (p.name || p.toolName || "tool") + " " + body;
+    }
+    if (p.type === "toolResult") {
+      var out = p.output != null ? String(p.output) : JSON.stringify(p);
+      if (out.length > 500) out = out.slice(0, 500) + "…[truncated]";
+      return out;
+    }
+    return p.text || p.thinking || p.content || "";
+  }
+
+  function sessionPartClass(p) {
+    if (p && typeof p === "object") {
+      if (p.type === "thinking") return "session-part part-thinking";
+      if (p.type === "toolCall" || p.type === "toolResult") return "session-part part-tool";
+    }
+    return "session-part part-text";
+  }
+
+  function appendSessionLine(feed, line) {
+    var row = document.createElement("div");
+    if (!line.ok) {
+      row.className = "session-msg session-raw";
+      var pre = document.createElement("pre");
+      pre.textContent = "#" + line.line_no + "（非 JSON） " + line.text;
+      row.appendChild(pre);
+      feed.appendChild(row);
+      return;
+    }
+    var d = line.data || {};
+    if (d.type === "message" && d.message) {
+      var m = d.message;
+      var role = m.role || "unknown";
+      row.className = "session-msg role-" + role;
+      var head = document.createElement("div");
+      head.className = "session-head";
+      var badge = document.createElement("span");
+      badge.className = "session-role"; badge.textContent = role;
+      var ts = document.createElement("span");
+      ts.className = "session-ts";
+      ts.textContent = "#" + line.line_no + (d.timestamp ? " · " + d.timestamp : "");
+      head.appendChild(badge); head.appendChild(ts);
+      row.appendChild(head);
+      var parts = Array.isArray(m.content) ? m.content
+                : (m.content != null ? [m.content] : []);
+      parts.forEach(function (p) {
+        var pd = document.createElement("div");
+        pd.className = sessionPartClass(p);
+        pd.textContent = sessionPartBody(p);
+        row.appendChild(pd);
+      });
+      if (!parts.length) {
+        var empty = document.createElement("div");
+        empty.className = "session-part part-text";
+        empty.textContent = "（空内容）";
+        row.appendChild(empty);
+      }
+    } else {
+      // 系统元数据行（session/model_change/thinking_level_change/…）：单行弱化展示
+      row.className = "session-msg session-sys";
+      var sys = document.createElement("div");
+      sys.className = "session-sys-line";
+      sys.textContent = "#" + line.line_no + " · " + (d.type || "raw") +
+                        (d.modelId ? " · " + d.modelId : "") +
+                        (d.thinkingLevel ? " · thinking=" + d.thinkingLevel : "");
+      row.appendChild(sys);
+    }
+    feed.appendChild(row);
+  }
+
+  function renderSessionFeed(data) {
+    els.sessionFeed.innerHTML = "";
+    var lines = (data && data.lines) || [];
+    if (!lines.length) {
+      renderSessionPlaceholder("暂无行（等待 agent 推送增量）");
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    // 用临时容器复用 appendSessionLine 的 DOM 构建逻辑
+    var tmp = document.createElement("div");
+    lines.forEach(function (line) { appendSessionLine(tmp, line); });
+    while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+    els.sessionFeed.appendChild(frag);
+    els.sessionFeed.scrollTop = els.sessionFeed.scrollHeight; // 实时视角：跟随最新行
+    var meta = "最近 " + lines.length + " 行（共 " + data.line_count + "） · " +
+               (data.updated_at ? new Date(data.updated_at * 1000).toLocaleTimeString() : "—");
+    if (data.truncated) meta = "⚠ 积压未送达（truncated） · " + meta;
+    els.sessionMeta.textContent = meta;
+  }
+
+  function startSessionPolling() {
+    stopSessionPolling();
+    loadSessions();
+    state.session.timer = setInterval(loadSessions, 5000);
+  }
+
+  function stopSessionPolling() {
+    if (state.session.timer) {
+      clearInterval(state.session.timer);
+      state.session.timer = null;
+    }
+  }
+
   // —— 事件绑定 ——
   els.refreshBtn.addEventListener("click", refresh);
+  // TASK-073: Session 选择器 + 实时开关
+  els.sessionTask.addEventListener("change", function () {
+    state.session.task = this.value || null;
+    state.session.file = null;
+    loadSessions();
+  });
+  els.sessionFile.addEventListener("change", function () {
+    state.session.file = this.value || null;
+    if (state.session.file) loadSessionLines();
+    else renderSessionPlaceholder("选择文件查看会话内容");
+  });
+  els.sessionLiveToggle.addEventListener("change", function () {
+    if (this.checked && state.activeNav === "sessions") startSessionPolling();
+    else stopSessionPolling();
+  });
   els.detailClose.addEventListener("click", closeTaskDetail);
   document.addEventListener("keydown", function (e) {
     if (e.key === "Escape") {

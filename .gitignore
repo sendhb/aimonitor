@@ -60,3 +60,7 @@ dist/
 
 # 运行时数据（历史快照 SQLite，TASK-022：监控器自身存储，不进 git）
 data/
+config/agent-tokens-*.md
+
+# AIOS 框架源（kit/ 仅本地模板，不进 git 库）
+kit/

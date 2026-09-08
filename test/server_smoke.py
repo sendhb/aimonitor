@@ -20,9 +20,14 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import date, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "server"))
+
+# 日期地雷防护（TASK-071 拆弹）：需「近期未 stale」夹具一律用相对日期，
+# 随测试日推进自动保鲜（原写死 2026-08-15/17，14 天阈值后必炸）
+FRESH_UPDATED = (date.today() - timedelta(days=5)).isoformat()
 
 
 def test_py_compile():
@@ -113,7 +118,7 @@ def test_derive_alerts():
         "tasks": [
             {"id": "TASK-001", "status": "open", "updated": "2000-01-01"},
             {"id": "TASK-002", "status": "done", "updated": "2000-01-01"},
-            {"id": "TASK-003", "status": "in-progress", "updated": "2026-08-15"},
+            {"id": "TASK-003", "status": "in-progress", "updated": FRESH_UPDATED},
         ],
     }
     cfg = {"heartbeat_stale_threshold_seconds": 300,
@@ -1750,9 +1755,10 @@ def test_agent_ingest_integration():
     """
     import monitor_server as ms
 
-    # aibase 组件（kit 源仓库，AGENTS.md：aibase = kit 源仓库；agent 归属 §3.1.5
-    # aibase/kit/tools/agent/，本仓库 config/projects.json 已注册 aibase 项目）
-    aibase_agent_dir = os.path.join(ROOT, "..", "aibase", "kit", "tools", "agent")
+    # aibase 组件（kit 源仓库，AGENTS.md：aibase = kit 源仓库；agent 归属
+    # aibase/kit/tools/telemetry/，aibase TASK-092 由 agent/ 改名 telemetry/，
+    # 本仓库 config/projects.json 已注册 aibase 项目）
+    aibase_agent_dir = os.path.join(ROOT, "..", "aibase", "kit", "tools", "telemetry")
     assert os.path.isdir(aibase_agent_dir), \
         f"aibase agent 组件缺失（{aibase_agent_dir}）——集成测试需真实组件（TASK-042）"
     sys.path.insert(0, aibase_agent_dir)
@@ -1774,7 +1780,7 @@ def test_agent_ingest_integration():
         with open(os.path.join(rt, "tasks", "TASK-001-demo.md"), "w", encoding="utf-8") as f:
             f.write("---\nname: TASK-001-demo\nmetadata:\n  status: in-progress\n"
                     "  priority: P1\n  assignee: coder\n  reviewer: autoloop-reviewer\n"
-                    "  updated: 2026-08-17\n---\n# TASK-001\n## 目标\n集成测试任务\n")
+                    "  updated: " + FRESH_UPDATED + "\n---\n# TASK-001\n## 目标\n集成测试任务\n")
         with open(os.path.join(rt, "tasks", "TASK-002-demo.md"), "w", encoding="utf-8") as f:
             f.write("---\nname: TASK-002-demo\nmetadata:\n  status: done\n---\n# TASK-002\n")
         with open(os.path.join(rt, "states", "CURRENT_FOCUS.md"), "w", encoding="utf-8") as f:
@@ -1910,8 +1916,8 @@ def test_dual_machine_verify():
     import sqlite3
     import monitor_server as ms
 
-    # aibase 组件（kit 源仓库，AGENTS.md：aibase = kit 源仓库；agent 归属 §3.1.5）
-    aibase_agent_dir = os.path.join(ROOT, "..", "aibase", "kit", "tools", "agent")
+    # aibase 组件（kit 源仓库；aibase TASK-092 由 kit/tools/agent/ 改名 telemetry/）
+    aibase_agent_dir = os.path.join(ROOT, "..", "aibase", "kit", "tools", "telemetry")
     assert os.path.isdir(aibase_agent_dir), \
         f"aibase agent 组件缺失（{aibase_agent_dir}）——双机验证需真实组件（TASK-045）"
     sys.path.insert(0, aibase_agent_dir)
@@ -1932,7 +1938,7 @@ def test_dual_machine_verify():
             with open(os.path.join(rt, "tasks", f"{task_id}.md"), "w", encoding="utf-8") as f:
                 f.write(f"---\nname: {task_id}\nmetadata:\n  status: in-progress\n"
                         f"  priority: P1\n  assignee: coder\n"
-                        f"  reviewer: autoloop-reviewer\n  updated: 2026-08-17\n---\n"
+                        f"  reviewer: autoloop-reviewer\n  updated: {FRESH_UPDATED}\n---\n"
                         f"# {task_id}\n## 目标\n双机验证任务\n")
             with open(os.path.join(rt, "states", "CURRENT_FOCUS.md"), "w",
                       encoding="utf-8") as f:
@@ -4034,6 +4040,212 @@ def test_server():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_session_store():
+    """TASK-073：session 日志增量存储层单测（续传/幂等对账/重建重置/滚动上限/查询边界）。"""
+    import monitor_server as ms
+    tmpdir = tempfile.mkdtemp(prefix="aimonitor-session-store-")
+    try:
+        store = ms.IngestStore(os.path.join(tmpdir, "ingest.db"))
+
+        def sessions(items, truncated=False, cursor=None):
+            return {"items": items, "truncated": truncated,
+                    "cursor": cursor if cursor is not None else {}}
+
+        def files(name, lines):
+            return {"name": name, "lines": lines}
+
+        # 1. 新文件追加：line_no 从 1 连续递增，行原文往返一致
+        store.store_session_deltas(
+            "proj-a", sessions([{"task_id": "TASK-1", "files": [files("a.jsonl", ["L1", "L2"])]}],
+                               cursor={"TASK-1/a.jsonl": 10}))
+        assert store.read_session_lines("proj-a", "TASK-1", "a.jsonl", 10) == \
+            [{"line_no": 1, "text": "L1"}, {"line_no": 2, "text": "L2"}]
+
+        # 2. 游标推进 → 纯新增续传
+        store.store_session_deltas(
+            "proj-a", sessions([{"task_id": "TASK-1", "files": [files("a.jsonl", ["L3"])]}],
+                               cursor={"TASK-1/a.jsonl": 13}))
+        assert [x["text"] for x in store.read_session_lines("proj-a", "TASK-1", "a.jsonl", 10)] == \
+            ["L1", "L2", "L3"]
+
+        # 3. 纯重放（游标同位，agent 推送成功但未落游标后重推）→ 幂等不重复
+        store.store_session_deltas(
+            "proj-a", sessions([{"task_id": "TASK-1", "files": [files("a.jsonl", ["L3"])]}],
+                               cursor={"TASK-1/a.jsonl": 13}))
+        assert len(store.read_session_lines("proj-a", "TASK-1", "a.jsonl", 10)) == 3
+
+        # 4. 混合重推（重放 + 新增，文件增长后游标持久化失败窗口）→ 前缀重叠对账只补新行
+        store.store_session_deltas(
+            "proj-a", sessions([{"task_id": "TASK-1", "files": [files("a.jsonl", ["L3", "L4"])]}],
+                               cursor={"TASK-1/a.jsonl": 16}))
+        assert [x["text"] for x in store.read_session_lines("proj-a", "TASK-1", "a.jsonl", 10)] == \
+            ["L1", "L2", "L3", "L4"]
+
+        # 5. 重建/截断（agent 游标倒退）→ 归零重收，旧行不残留
+        store.store_session_deltas(
+            "proj-a", sessions([{"task_id": "TASK-1", "files": [files("a.jsonl", ["R1", "R2"])]}],
+                               cursor={"TASK-1/a.jsonl": 9}))
+        assert [x["text"] for x in store.read_session_lines("proj-a", "TASK-1", "a.jsonl", 10)] == \
+            ["R1", "R2"]
+
+        # 6. 追平空批（items=[] + cursor）→ 行不变 + truncated 批标志透传到 summary
+        store.store_session_deltas("proj-a", sessions([], truncated=True,
+                                                      cursor={"TASK-1/a.jsonl": 9}))
+        summary = store.read_sessions_summary("proj-a")
+        assert summary["truncated"] is True and summary["last_push"] > 0
+        assert summary["tasks"][0]["files"][0]["line_count"] == 2
+
+        # 7. 滚动上限：超出窗口删最旧行，行号高水位不回退（继续续传不撞主键）
+        real_cap = ms.SESSION_MAX_LINES_PER_FILE
+        ms.SESSION_MAX_LINES_PER_FILE = 3
+        try:
+            for i in range(5):
+                store.store_session_deltas(
+                    "proj-a", sessions([{"task_id": "TASK-2",
+                                          "files": [files("b.jsonl", ["X%d" % i])]}],
+                                       cursor={"TASK-2/b.jsonl": (i + 1) * 4}))
+            got = [x["text"] for x in store.read_session_lines("proj-a", "TASK-2", "b.jsonl", 10)]
+            assert got == ["X2", "X3", "X4"], got
+            assert store.read_sessions_summary("proj-a")["tasks"][1]["files"][0]["line_count"] == 3
+        finally:
+            ms.SESSION_MAX_LINES_PER_FILE = real_cap
+
+        # 8. 查询边界：limit 0 / 非法 / 超上限截断；未接收项目 → tasks=[]
+        assert store.read_session_lines("proj-a", "TASK-2", "b.jsonl", 0) == []
+        assert store.read_session_lines("proj-a", "TASK-2", "b.jsonl", "abc") == []
+        assert len(store.read_session_lines("proj-a", "TASK-2", "b.jsonl", 10 ** 9)) == 3
+        empty = store.read_sessions_summary("no-such-project")
+        assert empty["tasks"] == [] and empty["truncated"] is False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    print("✓ TASK-073 session 存储层（续传/幂等/重建/滚动上限/查询边界）")
+
+
+def test_session_ingest_endpoint():
+    """TASK-073：/api/ingest sessions 增量端点 + /api/projects/:id/sessions 查询端点
+    （200 落库 / 查询视图 / truncated 透传 / v1.0 向后兼容 / schema 400）。"""
+    import monitor_server as ms
+
+    with open(os.path.join(ROOT, "config", "projects.json"), encoding="utf-8") as f:
+        config = json.load(f)
+
+    tmpdir = tempfile.mkdtemp(prefix="aimonitor-session-ep-")
+    try:
+        agents_path = _write_agents_file(tmpdir, {"aimonitor": "test-token"})
+        ms.ApiHandler.state = ms.State(config, quiet=True,
+                                       db_path=os.path.join(tmpdir, "history.db"),
+                                       ingest_db_path=os.path.join(tmpdir, "ingest.db"),
+                                       agents_path=agents_path,
+                                       projects_path=os.path.join(tmpdir, "projects.json"),
+                                       start_poller=False)
+        ms.ApiHandler.state.poll()
+        ms.ApiHandler.static_dir = os.path.join(ROOT, "src")
+
+        port = free_port()
+        httpd = ms.ThreadingHTTPServer(("127.0.0.1", port), ms.ApiHandler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        def post(body):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/api/ingest", body=json.dumps(body),
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": "Bearer test-token"})
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
+            return resp.status, raw
+
+        def get(path):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
+            return resp.status, json.loads(raw)
+
+        base = {"project_id": "aimonitor", "ts": 1720000000, "files": {"tasks": []}}
+
+        # 1. v1.0 向后兼容：无 sessions 键的旧 payload → 仍 200，session 概览为空
+        status, raw = post(base)
+        assert status == 200, f"v1.0 旧 payload 应 200：{status} {raw[:200]}"
+        status, data = get("/api/projects/aimonitor/sessions")
+        assert status == 200 and data["tasks"] == [] and data["truncated"] is False, data
+
+        # 2. 带 sessions 增量 → 200 落库；概览按 task/file 分组返回行数与游标
+        msg = json.dumps({"type": "message", "message": {"role": "assistant",
+                                                         "content": [{"type": "text", "text": "hi"}]}})
+        payload = dict(base, sessions={
+            "items": [{"task_id": "TASK-073", "files": [
+                {"name": "s1.jsonl", "lines": [msg, "not-json-line"]}]}],
+            "truncated": True,
+            "cursor": {"TASK-073/s1.jsonl": 100},
+        })
+        status, raw = post(payload)
+        assert status == 200, f"sessions payload 应 200：{status} {raw[:200]}"
+        status, data = get("/api/projects/aimonitor/sessions")
+        assert status == 200 and data["truncated"] is True, data
+        t0 = data["tasks"][0]
+        assert t0["task_id"] == "TASK-073" and t0["files"][0]["name"] == "s1.jsonl", data
+        assert t0["files"][0]["line_count"] == 2 and t0["files"][0]["last_offset"] == 100, data
+
+        # 3. 续传第二批 → 行视图（最近 limit 行升序）：合法 JSON ok/type/data，损坏行 ok=false 原样保留
+        payload["sessions"]["items"][0]["files"][0]["lines"] = ["{\"type\":\"message\"}"]
+        payload["sessions"]["cursor"]["TASK-073/s1.jsonl"] = 120
+        payload["sessions"]["truncated"] = False
+        status, raw = post(payload)
+        assert status == 200
+        status, data = get("/api/projects/aimonitor/sessions?task=TASK-073&file=s1.jsonl&limit=200")
+        assert status == 200, data
+        assert data["line_count"] == 3 and data["truncated"] is False and data["limit"] == 200, data
+        lines = data["lines"]
+        assert [x["line_no"] for x in lines] == [1, 2, 3], lines
+        assert lines[0]["ok"] is True and lines[0]["type"] == "message"
+        assert lines[0]["data"]["message"]["role"] == "assistant", lines[0]
+        assert lines[1]["ok"] is False and lines[1]["text"] == "not-json-line", lines[1]
+
+        # 4. limit 边界：非法值 400；task 不存在 → files=[] 不 404
+        for bad in ("?task=T&file=f&limit=0", "?task=T&file=f&limit=-1",
+                    "?task=T&file=f&limit=abc", "?task=T&file=f&limit=1.5",
+                    f"?task=T&file=f&limit={ms.SESSION_QUERY_MAX_LINES + 1}"):
+            status, raw = get("/api/projects/aimonitor/sessions" + bad)
+            assert status == 400, f"{bad} 应 400：{status}"
+        status, data = get("/api/projects/aimonitor/sessions?task=NOPE")
+        assert status == 200 and data["files"] == [], data
+
+        # 5. 未注册项目 → 404
+        status, raw = get("/api/projects/no-such/sessions")
+        assert status == 404, status
+
+        # 6. schema 400：sessions 各字段类型错 + 单行超 64KiB 字节上限（fail loud）
+        for bad_sessions in (
+            "not-a-dict",
+            {"items": "not-a-list"},
+            {"items": [{"task_id": "", "files": []}]},
+            {"items": [{"task_id": "T", "files": "not-a-list"}]},
+            {"items": [{"task_id": "T", "files": [{"name": "", "lines": []}]}]},
+            {"items": [{"task_id": "T", "files": [{"name": "a", "lines": "not-a-list"}]}]},
+            {"items": [{"task_id": "T", "files": [{"name": "a", "lines": [1]}]}]},
+            {"items": [{"task_id": "T", "files": [{"name": "a", "lines": ["x"]}]}],
+             "truncated": "yes"},
+            {"cursor": -1},
+            {"cursor": {"T/a": True}},
+            {"items": [{"task_id": "T", "files": [
+                {"name": "a", "lines": ["x" * (ms.MAX_SESSION_LINE_BYTES + 1)]}]}]},
+        ):
+            status, raw = post(dict(base, sessions=bad_sessions))
+            assert status == 400, f"sessions={str(bad_sessions)[:60]} 应 400：{status} {raw[:120]}"
+
+        # 7. 落库往返：库内行与推送原文一致（agent 不解析不丢内容的对称面）
+        rows = ms.ApiHandler.state.ingest.read_session_lines("aimonitor", "TASK-073", "s1.jsonl", 10)
+        assert rows[0]["text"] == msg and rows[1]["text"] == "not-json-line", rows
+    finally:
+        httpd.shutdown()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    print("✓ TASK-073 session ingest/查询端点（v1.0 兼容 / 分组查询 / truncated / schema 400）")
+
+
 def main():
     test_py_compile()
     test_config_json()
@@ -4051,6 +4263,8 @@ def main():
     test_ingest_store()
     test_ingest_endpoint()
     test_task_events_ingest()
+    test_session_store()
+    test_session_ingest_endpoint()
     test_ingest_auth()
     test_ingest_scope_conflict()
     test_ingest_rate_limit()

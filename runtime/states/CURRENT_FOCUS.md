@@ -2,7 +2,7 @@
 name: CURRENT_FOCUS
 metadata:
   type: state
-  updated: 2026-08-23
+  updated: 2026-09-07
 ---
 
 # Current Focus — 2026-08-01

@@ -119,6 +119,7 @@ aimonitor 服务端
 | 响应 | `200 { "ok": true, "project_id": "<id>" }`；失败 `400`（schema 错）/ `401`（鉴权失败）/ `409`（同 id 已被另一 agent 占用，见 §3.1.6）/ `413`（payload 超限） |
 | 幂等 | 同 `project_id` 同一 agent 重复推送覆盖写（`INSERT OR REPLACE` 语义；实现用 `INSERT ... ON CONFLICT DO UPDATE` 保留 `task_cursor`，见下），无副作用；**不同 agent 推同一 id → 409** |
 | 任务事件流（TASK-066/071，可选） | payload 顶层可选 `events`（数组，task 事件增量）与 `cursor`（整数，已确认覆盖最大 seq）。`events[]` 为 `{seq, ts, ev, task, from, to, actor, commit, dispatch_ref?, reason?}`；seq 整数 ≥1 且批内严格单调递增；单批 ≤ 200（超限 `400`，不静默截断）；`cursor` 整数 ≥0 且 ≥ 批内最大 seq。服务端按 `(project_id, seq)` 幂等去重；`cursor` 只推进不倒退（事件启用后混入旧 payload 重推不清空已确认 cursor） |
+| session 日志增量（TASK-073，契约 v1.1 = aibase TASK-104 agent 端，可选） | payload 顶层可选 `sessions`：`{items, truncated, cursor}`。`items[]` = `[{task_id, files: [{name, lines: [原始 jsonl 行文本...]}]}]`（agent 不解析不丢内容，损坏行由服务端查询层宽松标注）；`truncated` bool = 本轮有未送达积压（下轮续推）；`cursor` = `{"<TASK-ID>/<文件名>": 字节偏移}`（本轮确认覆盖，只反映实际装入行；空批追平时也携带）。服务端逐文件续传 + 幂等对账（游标同位跳过 / 内容前缀重叠对账 / 游标倒退归零重收）+ 滚动上限 5000 行/文件；单行 > 64KiB → `400`（agent 端已截断，超限 = 契约违反）；缺省 `sessions` = 未启用（v1.0 旧 payload 仍 `200`）。落库失败 → `500`。查询：`GET /api/projects/:id/sessions`（§4.8） |
 | 限流 | 每 agent 每分钟 N 次（可配置），超限 `429` |
 
 > TASK-042（契约对齐）：请求体为 **AIOS 通用遥测格式**（aibase 组件 agent 输出，file-oriented）。
@@ -130,6 +131,13 @@ aimonitor 服务端
 > seq/cursor 规则与 aibase `kit/tools/agent/README.md` §事件流契约一致；旧 payload
 > （无 `events`/`cursor` 键）仍 `200`，`files` 快照照常落库，task 事件表不写入。
 > 事件落库失败 → `500`（不静默丢弃，审计级真相）。
+
+> TASK-073（session 日志增量）：ingest 可选消费 aibase TASK-103 落盘的 pi 会话
+> transcript（`runtime/logs/sessions/<TASK-ID>/*.jsonl`）经 TASK-104 agent 端
+> 游标增量推送的消息级增量。契约 v1.1 见 aibase `kit/tools/telemetry/README.md`
+> §session log 上行；服务端逐文件接收状态（行数 + agent 字节游标）+ 逐行原文落库
+> （SQLite `session_files`/`session_lines`/`session_state` 三表），查询端点与
+> 查看页见 §4.8。旧 payload（无 `sessions` 键）仍 `200` 零回归。
 
 ### 3.1.4 心跳与离线语义
 
@@ -823,6 +831,22 @@ aimon_{project_id}_{uuid4}_{random_hex}
   - 项目 id 未注册 → `404` + JSON 错误（资源型路由；与 §4.2 的"无数据 200"区分——项目存在但无事件仍 `200` + 空数组）。
   - `limit` 非数字 / 非有限数（`NaN`/`inf`，沿用 TASK-022 BUG-001 修复模式）/ 非整数 / 超出范围 → `400` + JSON 错误。
 
+## 4.8 Session 日志 API（`GET /api/projects/:id/sessions`，TASK-073）
+
+agent 推送的 session 日志增量（§3.1.3 TASK-073 行）的人读查询端点（无鉴权，与既有
+仪表盘 GET 端点一致，仅限局域网/可信网络使用）。单端点双视图，参数分派：
+
+| 调用 | 响应 |
+|------|------|
+| 无 `task`（概览） | `{project, generated_at, truncated, last_push, tasks: [{task_id, files: [{name, line_count, last_offset, updated_at}]}]}`；`truncated` = 最近一批有积压；无接收记录 → `tasks: []` |
+| `task=<id>&file=<名>&limit=<n>`（行视图） | `{project, task, file, line_count, last_offset, updated_at, truncated, limit, generated_at, lines: [{line_no, ok, type, data\|text}]}`——最近 `limit` 行**升序**；每行宽松 JSON 解析：合法 → `{line_no, ok: true, type, data}`（`type` = 顶层 `type` 字段，如 `message`/`session`）；损坏 → `{line_no, ok: false, text: <原文>}`（不丢弃） |
+| `task=<id>` 无 `file`（文件列表） | `{project, task, generated_at, truncated, files: [...]}` |
+
+- `limit` 默认 200，合法范围 `(0, 1000]`，非法（0/负/非数字/非整数/超上限）→ `400`；
+- 项目未注册 → `404`（与 §4.3 同语义）；
+- 前端查看页（§6.1）**5s 轮询**消费本端点（选型：agent 推送周期 30s + 消息级粒度下
+  满足 ≤10s 级感知；SSE 增益有限，不引入）。
+
 ## 5. 后端服务（`server/monitor_server.py`）
 
 - **语言/依赖**：Python 3.12 **标准库**（`http.server` + `json` + `os` + `time` + `threading`），零第三方依赖
@@ -834,6 +858,7 @@ aimon_{project_id}_{uuid4}_{random_hex}
   - `GET /api/status` → 第 4 节聚合 JSON（`Content-Type: application/json`）；支持 §4.5 筛选参数（`status`/`priority`/`assignee`/`q`，仅作用于 `tasks[]`，聚合字段保持全量）；含 §4.6 告警派生（顶层 `alerts` + 每项目 `alerts`，轮询时派生，不受筛选影响）
   - `GET /api/history?project=<id>&hours=<n>` → 第 4.2 节历史时间序列（`Content-Type: application/json`）
   - `GET /api/projects/<id>/events?limit=<n>` → 第 4.3 节事件时间线（`Content-Type: application/json`）
+  - `GET /api/projects/<id>/sessions[?task=&file=&limit=]` → 第 4.8 节 Session 日志查询（TASK-073，`Content-Type: application/json`）
   - `POST /api/ingest` → §3.1.3 Agent 推送入口（Bearer token 鉴权；落库 `ingest_state`）
   - `GET /` 及其他静态路径 → 服务前端页面（默认 `dist/`；`--dev` 时服务 `src/`）
 - **端口**：默认 `3113`（`--port` 可覆盖；31xx 段空闲，避开 3010/3011/3012 Docmost 与其它已用端口）
@@ -848,7 +873,7 @@ aimon_{project_id}_{uuid4}_{random_hex}
 
 | 区块 | 内容 | 数据来源 |
 |------|------|---------|
-| 侧边栏导航 | 左侧固定：logo、监控导航（总览/任务/执行流/趋势/告警，含计数）、项目列表（点击切换当前项目）、底部状态（项目数/轮询间隔/系统健康） | `projects[]` / `summary` / 告警计数（TASK-026：`alerts.count` 服务端派生） |
+| 侧边栏导航 | 左侧固定：logo、监控导航（总览/任务/执行流/Session 日志/趋势/告警，含计数）、项目列表（点击切换当前项目）、底部状态（项目数/轮询间隔/系统健康） | `projects[]` / `summary` / 告警计数（TASK-026：`alerts.count` 服务端派生） |
 | 顶栏 | 页面标题 + 更新时间、时间范围分段（24h/7d/30d，UI 占位，数据由 TASK-022/027 接入）、项目下拉筛选（`#project-select`）、刷新按钮（`#refresh-btn`）、主题切换按钮 | `projects` / `generated_at` / `poll_interval_seconds` |
 | 告警横幅 | 红色告警条：心跳卡死 / blocked 占比超阈值 / 任务长期未更新 / 项目读取错误（TASK-026：服务端派生 `alerts.items`，前端直接消费） | `alerts.items` |
 | 指标卡 | 当前项目 6 卡：总任务(done/total)、完成率、进行中、审查中、阻塞、Coder 心跳 | `summary` / `heartbeat` |
@@ -856,6 +881,7 @@ aimon_{project_id}_{uuid4}_{random_hex}
 | 项目总览表 | 所有项目一行一条：项目名、总任务、完成、完成率进度条、open/in-progress/in-review/blocked 计数、**告警列**（TASK-026：`projects[].alerts` 计数，悬浮显示条目明细）、心跳、VERIFY/REVIEW 计数（TASK-015）；**行可点击切换当前项目**（与顶部选择器联动，TASK-017） | `projects[]` / `summary` / `heartbeat` / 验证审查计数 / `alerts` |
 | 任务列表 | TASK 表格：任务、状态、优先级、风险、assignee、updated；筛选行：搜索框 + 状态/优先级/assignee 下拉（TASK-025 后端化：筛选/搜索变化触发 `GET /api/status?status=&priority=&assignee=&q=`，任务行由服务端筛选结果渲染） | `tasks`（服务端筛选，§4.5） |
 | 事件时间线 | 事件流面板：按 role 渲染最近事件（outcome 圆点 + 时间 + 任务），outcome 计数；数据源 `GET /api/projects/:id/events?limit=10`（TASK-023），不再只用 `events.*.last` | `/api/projects/:id/events` |
+| Session 日志（TASK-073） | 面板 `#sessions-panel`：任务/文件两级下拉（含行数）→ 消息级会话流（role 徽章 user/assistant、思考弱化斜体、工具调用/结果 mono 块、系统行弱化、非 JSON 行红色原文），自动滚动跟随最新行，`truncated` 积压 ⚠ 标注；实时开关（默认开，5s 轮询，离开页面即停）；数据源 `GET /api/projects/:id/sessions`（§4.8） | `/api/projects/:id/sessions` |
 | 当前焦点 | CURRENT_FOCUS 文本（当前/下一步） | `focus` |
 | 任务状态分布 | 各状态数量分布（色块条 + 图例） | `summary` |
 | 详情抽屉 | 右侧固定抽屉：点击任务行显示 slug/名称/描述/状态/优先级/风险/assignee/reviewer/updated + **完整正文**（目标/范围/计划/风险与审批/当前进度/子任务/备注）、验收标准 checklist（含勾选态）、依赖、关联 VERIFY/REVIEW 记录（TASK-024） | `tasks[].detail` |
