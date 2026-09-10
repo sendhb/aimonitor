@@ -1,5 +1,5 @@
 {
-  "poll_interval_seconds": 30,
+  "poll_interval_seconds": 10,
   "heartbeat_stale_threshold_seconds": 900,
   "history_retention_days": 90,
   "alert_blocked_ratio_threshold": 0.2,
@@ -15,6 +15,7 @@
     {
       "id": "aibase",
       "name": "aibase",
+      "group": "aibase",
       "path": "/home/hb/code/aibase"
     },
     {
@@ -33,14 +34,49 @@
       "path": "/home/hb/code/account"
     },
     {
-      "id": "x1-prototype",
-      "name": "x1-prototype",
-      "path": "/home/hb/code/x1-prototype"
-    },
-    {
       "id": "baseline",
       "name": "baseline",
+      "group": "baseline",
       "path": "/home/hb/code/baseline"
+    },
+    {
+      "id": "ue-learning",
+      "name": "ue-learning",
+      "group": "ue-learning",
+      "path": "/home/hb/code/ue-learning"
+    },
+    {
+      "id": "hb-share-aibase",
+      "name": "hb-share-aibase",
+      "group": "aibase",
+      "path": "D:/share/the5/aibase",
+      "transport": "agent"
+    },
+    {
+      "id": "hb-share-ue-learning",
+      "name": "hb-share-ue-learning",
+      "group": "ue-learning",
+      "path": "D:/share/the5/ue-learning",
+      "transport": "agent"
+    },
+    {
+      "id": "hb-share-baseline",
+      "name": "hb-share-baseline",
+      "group": "baseline",
+      "path": "D:/share/the5/baseline",
+      "transport": "agent"
+    },
+    {
+      "id": "x1art",
+      "name": "x1art",
+      "path": "D:/share/the5/x1art",
+      "transport": "agent"
+    },
+    {
+      "id": "x1prototype",
+      "name": "x1prototype",
+      "path": "D:/share/the5/x1prototype",
+      "transport": "agent"
     }
   ]
 }

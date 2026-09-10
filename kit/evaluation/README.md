@@ -15,10 +15,21 @@
 
 ## 使用方法
 
-1. 每个任务 closed 时自动记录 `metrics/`（通过 `cli/task index` 或 CI）
-2. 每次验证失败自动记录 `failures/`（`aios/execution/engine.md` 的 Repair 环）
-3. 定期生成 `reports/`（周/月），对比模型版本、工作量趋势
-4. `benchmarks/` 存放可复现的 AI 能力基准测试（如：同一个任务用 Claude Sonnet vs GPT-4o 对比）
+采集已接入 `cli/task` 的天然落盘点（TASK-093，单源在 `cli/lib/tasklib.py`）：
+
+1. 任务 closed（→ done）时自动追加一条 `metrics/task-metrics.jsonl`：
+   `task/risk/priority/rework-count/created/updated/duration_days/done_at`
+   （`task done` 与 `task approve` 两条关闭路径都触发，采集异常只告警不阻塞）
+2. 验证失败时自动追加一条 `failures/failures.jsonl`：
+   `task/date/failed_command/fail_log`（`fail_log` 指向 `runtime/logs/fail-<date>.log`）
+3. `task metrics [--days N]` 汇总查询：done 率（runtime/tasks 实时口径）、
+   平均 rework-count（优先 metrics 采集数据，无数据回退实时 frontmatter）、
+   token 估算合计（聚合 `runtime/logs/token-usage.jsonl`；无数据输出 N/A 不报错）
+4. 定期生成 `reports/`（周/月），对比模型版本、工作量趋势
+5. `benchmarks/` 存放可复现的 AI 能力基准测试（如：同一个任务用 Claude Sonnet vs GPT-4o 对比）
+
+人工补充的定性评估（模型名、审查发现数等）仍走 `reports/` 模板；
+自动采集只负责机器可聚合的客观数据。
 
 ## 模板
 

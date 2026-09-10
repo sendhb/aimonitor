@@ -80,7 +80,7 @@ def make_task(project_root, name, status):
 
 def make_projects(root):
     """在 temp root 下建 6 个本地项目 runtime/，agent 4 条路径不存在。"""
-    fixture = sample_registry(root)
+    fixture = sample_registry(root, agent_path_prefix=os.path.join(root, "__nonexistent_agents__"))
     local_statuses = {
         "aimonitor": ["open", "open", "in-progress", "done"],          # open=2, in-progress=1, done=1
         "aibase": ["in-review", "blocked", "cancelled"],               # in-review=1, blocked=1, cancelled=1
@@ -156,7 +156,7 @@ class ProbeCliTests(unittest.TestCase):
     def _run(self, cfg, *extra):
         return subprocess.run(
             [sys.executable, DISPATCHER_PY, *extra, "--config", cfg],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
 
     def test_scan_counts_only_local_and_skips_agent(self):

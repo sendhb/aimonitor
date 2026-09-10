@@ -138,7 +138,7 @@ class MkprojectKitLayoutTest(unittest.TestCase):
         (kit / "agents" / "coder").mkdir(parents=True)
         (kit / "cli").mkdir()
         (kit / "profiles").mkdir()
-        (kit / "tools" / "agent").mkdir(parents=True)
+        (kit / "tools" / "telemetry").mkdir(parents=True)
         (kit / "runtime" / "tasks").mkdir(parents=True)
         # 源仓库根：AGENTS.md（完整导航，含 kit/ 前缀路径）+ aios.config.yaml（项目配置在根）
         (src_root / "AGENTS.md").write_text(
@@ -149,8 +149,8 @@ class MkprojectKitLayoutTest(unittest.TestCase):
         (kit / "runtime" / "tasks" / "TASK.template.md").write_text("---\nname: TASK.template\n---\n", encoding="utf-8")
         (kit / "agents" / "coder" / "role.md").write_text("# coder role\n", encoding="utf-8")
         (kit / "cli" / "task").write_text("#!/usr/bin/env python3\nprint('kit task')\n", encoding="utf-8")
-        (kit / "tools" / "agent" / "agent.py").write_text(
-            "#!/usr/bin/env python3\n# AIOS telemetry agent (TASK-029: mkproject 集成)", encoding="utf-8")
+        (kit / "tools" / "telemetry" / "agent.py").write_text(
+            "#!/usr/bin/env python3\n# AIOS telemetry agent (TASK-029: mkproject 集成，TASK-092 更名 telemetry)", encoding="utf-8")
         return kit
 
     def test_mkproject_creates_kit_subdir_layout(self):
@@ -165,9 +165,11 @@ class MkprojectKitLayoutTest(unittest.TestCase):
         self.assertFalse((project / "kit" / "aios.config.yaml").exists())
         self.assertTrue((project / "kit" / "aios" / "governance").is_dir())
         self.assertTrue((project / "kit" / "agents" / "coder" / "role.md").is_file())
-        # TASK-029 集成：mkproject 生成项目自动携带 kit/tools/agent/（遥测 agent 整目录）
-        self.assertTrue((project / "kit" / "tools" / "agent" / "agent.py").is_file(),
-                        "生成项目应携带 kit/tools/agent/agent.py")
+        # TASK-029 集成：mkproject 生成项目自动携带 kit/tools/telemetry/（遥测守护进程整目录，TASK-092 更名）
+        self.assertTrue((project / "kit" / "tools" / "telemetry" / "agent.py").is_file(),
+                        "生成项目应携带 kit/tools/telemetry/agent.py")
+        self.assertFalse((project / "kit" / "tools" / "agent").exists(),
+                         "旧 tools/agent 目录不应再分发（TASK-092 更名 telemetry）")
         # 项目内容留根
         self.assertTrue((project / "aios.config.yaml").is_file())
         self.assertTrue((project / "AGENTS.md").is_file())

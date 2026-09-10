@@ -20,7 +20,7 @@
 #   --install-yes        配合 --install-deps，跳过确认直接执行
 #
 # 安装产物（与 cli/mkproject 生成的结构一致，可装进已存在的项目）:
-#   <目标>/kit/             框架（只读，升级时整体替换）
+#   <目标>/kit/             框架（只读，升级用 kit/cli/re-init 整体重建）
 #   <目标>/AGENTS.md        统一规则入口（25+ 工具原生读取，完整框架导航）
 #   <目标>/CLAUDE.md        → symlink AGENTS.md（Claude Code；Windows 需开发者模式/管理员）
 #   <目标>/.cursor/         Cursor 条件规则（*.mdc）
@@ -472,7 +472,7 @@ def main():
     print()
     print("═══ 安装完成 ═══")
     print("入口文件:")
-    print("  kit/          — 框架（只读，升级时整体替换）")
+    print("  kit/          — 框架（只读，升级: kit/cli/re-init <目标> 整体重建）")
     print("  AGENTS.md     — 统一入口（pi/OpenCode/Qwen Code/Cursor/Copilot 原生读取）")
     print("  CLAUDE.md     — symlink → AGENTS.md（Claude Code）")
     print("  .pi/SYSTEM.md — pi 系统提示词（治理规则注入）")

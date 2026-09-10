@@ -65,11 +65,7 @@ RENEW_RE = re.compile(r"^/api/register/([^/]+)/renew$")
 # 注册码管理端点（TASK-057）
 CODES_GENERATE_RE = re.compile(r"^/api/register/codes/generate$")
 CODES_REVOKE_RE = re.compile(r"^/api/register/codes/([^/]+)/revoke$")
-# 下行指令队列（TASK-035，AGENT-DOWNLINK-CONTRACT）
-DOWNLINK_RESULT_RE = re.compile(r"^/api/downlink/commands/(\d+)/result$")
-DOWNLINK_STATUS_RE = re.compile(r"^/api/downlink/commands/(\d+)$")
-
-# 下行指令端点（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0 §一）
+# 下行指令端点（AGENT-DOWNLINK-CONTRACT v1.0 §一）
 DOWNLINK_COMMANDS_RE = re.compile(r"^/api/downlink/commands$")
 DOWNLINK_COMMAND_ID_RE = re.compile(r"^/api/downlink/commands/([^/]+)$")
 DOWNLINK_PICKUP_RE = re.compile(r"^/api/downlink/pickup$")
@@ -92,16 +88,9 @@ ALERT_STALE_STATUSES = ("open", "in-progress", "in-review", "blocked")
 
 # agent 推送存储（TASK-033/034）：默认库位置与 HistoryStore 同目录 data/ingest.db
 INGEST_DB_REL = ("data", "ingest.db")
-DOWNLINK_DB_REL = ("data", "downlink.db")
-# 下行指令（TASK-035，AGENT-DOWNLINK-CONTRACT §二/§三）：白名单/超时/重投上限/tail 截断
-ALLOWED_DOWNLINK_COMMANDS = frozenset({"task_start", "autoloop_coder", "autoloop_reviewer"})
-DOWNLINK_PICKUP_TIMEOUT_DEFAULT = 90   # > 2×poll_interval(30s)：未拾取即 stale
-DOWNLINK_MAX_REQUEUE = 2               # 重投 ≤2 次后 failed(human)
-DOWNLINK_TAIL_MAX_LINES = 200
-DOWNLINK_TERMINAL_STATUSES = ("done", "failed", "skipped")
 # 注册审批存储（TASK-047）：默认库位置 data/registration.db
 REGISTRATION_DB_REL = ("data", "registration.db")
-# 下行指令存储（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0）：默认库位置 data/downlink.db
+# 下行指令存储（AGENT-DOWNLINK-CONTRACT v1.0）：默认库位置 data/downlink.db
 DOWNLINK_DB_REL = ("data", "downlink.db")
 # ingest API（TASK-034，见 MONITOR-SPEC §3.1.3）：payload 上限，超限 413
 MAX_INGEST_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5MB（tasks+events 原文体量留足余量）
@@ -2056,208 +2045,6 @@ class TokenIssuer:
         remove_token(project_id, self.agents_path)
 
 
-_DOWNLINK_SECRET_RE = re.compile(r"(?i)authorization|bearer|token")
-
-
-def scrub_downlink_tail(text, max_lines=DOWNLINK_TAIL_MAX_LINES):
-    """回报 tail 脱敏 + 截断（TASK-035，AGENT-DOWNLINK-CONTRACT §四）。
-
-    剔除含凭据字样（authorization/bearer/token）的行——敏感数据不入下行通道/日志
-    （security-policy Rule of Two：② 不叠加）；行数钳制 ≤ max_lines。
-    """
-    if not isinstance(text, str) or not text:
-        return ""
-    lines = [ln for ln in text.splitlines() if not _DOWNLINK_SECRET_RE.search(ln)]
-    return "\n".join(lines[:max_lines])
-
-
-def validate_downlink_body(body):
-    """入队 schema 校验（TASK-035，契约 §二）；合法返回规范化 dict，非法返回错误消息 str。"""
-    if not isinstance(body, dict):
-        return "请求体必须是 JSON 对象"
-    project_id = body.get("project_id")
-    if not isinstance(project_id, str) or not project_id:
-        return "project_id 必须是非空字符串"
-    dedup_key = body.get("dedup_key")
-    if not isinstance(dedup_key, str) or not dedup_key:
-        return "dedup_key 必须是非空字符串"
-    command = body.get("command")
-    if not isinstance(command, dict):
-        return "command 必须是对象"
-    name = command.get("name")
-    if name not in ALLOWED_DOWNLINK_COMMANDS:
-        return "command.name 不在白名单"
-    args = command.get("args", [])
-    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-        return "command.args 必须是字符串数组"
-    timeout_secs = body.get("timeout_secs", 1800)
-    if not isinstance(timeout_secs, int) or not (1 <= timeout_secs <= 86400):
-        return "timeout_secs 必须是 1..86400 的整数"
-    return {"project_id": project_id, "dedup_key": dedup_key,
-            "command": {"name": name, "args": args}, "timeout_secs": timeout_secs}
-
-
-class DownlinkStore:
-    """下行指令队列存储层（TASK-035，AGENT-DOWNLINK-CONTRACT §二/§三）：stdlib sqlite3。
-
-    表 downlink_commands(command_id PK AUTOINCREMENT, dedup_key, project_id,
-    command_json, timeout_secs, status, created_by, created_at, picked_at,
-    finished_at, attempt, result_json)：
-    - command_id 即契约 seq（AUTOINCREMENT 单调递增，乱序/重放检测依据）
-    - 部分唯一索引 idx_dl_dedup：dedup_key 在 queued/running 态唯一（幂等入队 409 依据）；
-      终态后同 key 可再次入队（重试场景）
-    - 指令状态机（契约 §三）：queued →(pickup)→ running →(result)→ done/failed/skipped；
-      pickup 超时 → 重投（attempt+1，≤ max_requeue）→ failed(human)
-    - 连接模式复用 HistoryStore/IngestStore：每次操作独立连接 + WAL + 幂等建表自愈。
-    """
-
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.lock = threading.Lock()
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-
-    def _connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS downlink_commands(
-                command_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                dedup_key TEXT NOT NULL,
-                project_id TEXT NOT NULL,
-                command_json TEXT NOT NULL,
-                timeout_secs INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                created_by TEXT,
-                created_at REAL,
-                picked_at REAL,
-                finished_at REAL,
-                attempt INTEGER NOT NULL DEFAULT 0,
-                result_json TEXT)""")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dl_dedup ON downlink_commands(dedup_key) "
-            "WHERE status IN ('queued','running')")
-        return conn
-
-    @staticmethod
-    def _row_to_dict(row):
-        if row is None:
-            return None
-        d = dict(row)
-        d["command"] = json.loads(d.pop("command_json"))
-        if d.get("result_json"):
-            d["result"] = json.loads(d.pop("result_json"))
-        else:
-            d.pop("result_json", None)
-        d["seq"] = d["command_id"]
-        return d
-
-    def enqueue(self, project_id, dedup_key, command, timeout_secs, created_by, now):
-        """入队；返回 (row, reused)。reused=True 表示 dedup_key 已有未终态指令（409 语义）。"""
-        with self.lock:
-            conn = self._connect()
-            try:
-                existing = conn.execute(
-                    "SELECT * FROM downlink_commands WHERE dedup_key=? AND status IN ('queued','running')",
-                    (dedup_key,)).fetchone()
-                if existing is not None:
-                    return self._row_to_dict(existing), True
-                cur = conn.execute(
-                    "INSERT INTO downlink_commands(dedup_key, project_id, command_json, timeout_secs,"
-                    " status, created_by, created_at) VALUES(?,?,?,?,?,?,?)",
-                    (dedup_key, project_id, json.dumps(command, ensure_ascii=False),
-                     timeout_secs, "queued", created_by, now))
-                conn.commit()
-                row = conn.execute("SELECT * FROM downlink_commands WHERE command_id=?",
-                                   (cur.lastrowid,)).fetchone()
-                return self._row_to_dict(row), False
-            finally:
-                conn.close()
-
-    def pickup(self, allowed_projects, now,
-               pickup_timeout=DOWNLINK_PICKUP_TIMEOUT_DEFAULT,
-               max_requeue=DOWNLINK_MAX_REQUEUE):
-        """拾取（契约 §三/§五）：先回收超时未拾取指令（重投/判死），再领取 allowed 内最旧 queued。
-
-        - 超时 queued：attempt ≥ max_requeue → failed(pickup-timeout, human)；否则重投
-          （created_at 刷新 + attempt+1，pickup 超时窗口重新计时）
-        - 领取即置 running（picked_at=now），pickup 超时窗口自此终止——执行期只有
-          timeout_secs 生效（R2-001：「忙而非死」不误判 stale）
-        - allowed_projects 为空（fail-closed）→ 不下发任何指令
-        """
-        with self.lock:
-            conn = self._connect()
-            try:
-                stale = conn.execute(
-                    "SELECT * FROM downlink_commands WHERE status='queued' AND created_at IS NOT NULL").fetchall()
-                for row in stale:
-                    if now - row["created_at"] <= pickup_timeout:
-                        continue
-                    if row["attempt"] >= max_requeue:
-                        conn.execute(
-                            "UPDATE downlink_commands SET status='failed', finished_at=?, result_json=?"
-                            " WHERE command_id=?",
-                            (now, json.dumps({"reason": "pickup-timeout",
-                                              "attempts": row["attempt"] + 1}), row["command_id"]))
-                    else:
-                        conn.execute(
-                            "UPDATE downlink_commands SET created_at=?, attempt=attempt+1"
-                            " WHERE command_id=?", (now, row["command_id"]))
-                conn.commit()
-                if not allowed_projects:
-                    return None
-                marks = ",".join("?" for _ in allowed_projects)
-                row = conn.execute(
-                    f"SELECT * FROM downlink_commands WHERE status='queued' AND project_id IN ({marks})"
-                    " ORDER BY command_id LIMIT 1", tuple(allowed_projects)).fetchone()
-                if row is None:
-                    return None
-                conn.execute(
-                    "UPDATE downlink_commands SET status='running', picked_at=? WHERE command_id=?",
-                    (now, row["command_id"]))
-                conn.commit()
-                return self._row_to_dict(conn.execute(
-                    "SELECT * FROM downlink_commands WHERE command_id=?",
-                    (row["command_id"],)).fetchone())
-            finally:
-                conn.close()
-
-    def result(self, command_id, status, exit_code, stdout_tail, stderr_tail, now):
-        """回报终态；返回 (row, already_terminal)。already_terminal=True → 409 幂等忽略（契约 §五）。"""
-        with self.lock:
-            conn = self._connect()
-            try:
-                row = conn.execute("SELECT * FROM downlink_commands WHERE command_id=?",
-                                   (command_id,)).fetchone()
-                if row is None:
-                    return None, False
-                if row["status"] in DOWNLINK_TERMINAL_STATUSES:
-                    return self._row_to_dict(row), True
-                result = {"status": status, "exit_code": exit_code,
-                          "stdout_tail": stdout_tail, "stderr_tail": stderr_tail,
-                          "finished_at": now}
-                conn.execute(
-                    "UPDATE downlink_commands SET status=?, finished_at=?, result_json=?"
-                    " WHERE command_id=?",
-                    (status, now, json.dumps(result, ensure_ascii=False), command_id))
-                conn.commit()
-                return self._row_to_dict(conn.execute(
-                    "SELECT * FROM downlink_commands WHERE command_id=?",
-                    (command_id,)).fetchone()), False
-            finally:
-                conn.close()
-
-    def get(self, command_id):
-        with self.lock:
-            conn = self._connect()
-            try:
-                return self._row_to_dict(conn.execute(
-                    "SELECT * FROM downlink_commands WHERE command_id=?",
-                    (command_id,)).fetchone())
-            finally:
-                conn.close()
-
-
 class State:
     """聚合缓存 + 后台轮询线程（daemon）。"""
 
@@ -2277,10 +2064,6 @@ class State:
         # agent 推送存储（TASK-033/034）：默认 <ROOT>/data/ingest.db，测试可注入临时路径
         ingest_db_path = ingest_db_path or os.path.join(ROOT, *INGEST_DB_REL)
         self.ingest = IngestStore(ingest_db_path)
-        # 下行指令队列（TASK-035，AGENT-DOWNLINK-CONTRACT）：默认 <ROOT>/data/downlink.db，
-        # 测试可注入临时路径
-        downlink_db_path = downlink_db_path or os.path.join(ROOT, *DOWNLINK_DB_REL)
-        self.downlink = DownlinkStore(downlink_db_path)
         # agent token 配置（TASK-035）：config/agents.json（权限 600，gitignored），测试可注入临时路径
         agents_path = agents_path or os.path.join(ROOT, *AGENTS_CONFIG_REL)
         self.agents_path = agents_path
@@ -2308,7 +2091,7 @@ class State:
         self.projects_path = projects_path or CONFIG_PATH
         # 注册码存储（TASK-048）：与 RegistrationStore 同一 DB
         self.enrollment = EnrollmentCodeStore(registration_db_path)
-        # 下行指令存储（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0）：
+        # 下行指令存储（AGENT-DOWNLINK-CONTRACT v1.0）：
         # 默认 <ROOT>/data/downlink.db，测试可注入临时路径；事件经 self.ingest 落 task_events
         downlink_db_path = downlink_db_path or os.path.join(ROOT, *DOWNLINK_DB_REL)
         self.downlink = DownlinkStore(downlink_db_path, ingest_store=self.ingest,
@@ -3112,7 +2895,7 @@ class DownlinkStore:
                         row = conn.execute(
                             "SELECT command_id FROM command WHERE status='queued'"
                             f" AND project_id IN ({ph})"
-                            " ORDER BY created_at ASC LIMIT 1",
+                            " ORDER BY created_at ASC, seq ASC LIMIT 1",
                             tuple(allowed_projects)).fetchone()
                     if row is not None:
                         conn.execute(
@@ -3222,14 +3005,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         if m:
             self._register_status(m.group(1), query)
             return
-        # 下行指令队列（TASK-035）：agent 拾取 / dispatcher 状态轮询
-        if path == "/api/downlink/pickup":
-            self._downlink_pickup()
-            return
-        m = DOWNLINK_STATUS_RE.match(path)
-        if m:
-            self._downlink_status(int(m.group(1)))
-            return
         if path == "/api/register/codes":
             self._enrollment_codes_list(query)
             return
@@ -3281,17 +3056,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if m:
             self._enrollment_code_revoke(m.group(1))
             return
-        # 下行指令队列（TASK-035）：dispatcher 入队 / agent 回报
-        if path == "/api/downlink/commands":
-            self._downlink_enqueue()
-            return
-        m = DOWNLINK_RESULT_RE.match(path)
-        if m:
-            self._downlink_result(int(m.group(1)))
-            return
         if path == "/api/register":
             self._register()
             return
+        # 下行指令队列（AGENT-DOWNLINK-CONTRACT v1.0）：dispatcher 入队 / agent 回报
         m = DOWNLINK_RESULT_RE.match(path)
         if m:
             agent_id = self._downlink_gate()
@@ -3320,7 +3088,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         self._ingest(agent_id)
 
-    # ---------------- 下行指令端点（TASK-071，AGENT-DOWNLINK-CONTRACT v1.0） ----------------
+    # ---------------- 下行指令端点（AGENT-DOWNLINK-CONTRACT v1.0） ----------------
 
     def _downlink_gate(self):
         """下行端点共用前置（契约 §一）：Bearer 鉴权（401）→ 每 agent 限流（429）。
@@ -3384,10 +3152,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._json_error(400, "timeout_secs 必须是 1.."
                              f"{DOWNLINK_MAX_TIMEOUT_SECS} 的整数")
             return
-        proj = next((p for p in ApiHandler.state.config.get("projects", [])
-                     if p.get("id") == project_id), None)
+        # 注册表闸（契约 §一/§五）：读 projects.json **新鲜快照**——TASK-069 审批自动登记
+        # 后无需重启即生效；transport 缺省 local（MONITOR-SPEC §3.1），非显式 agent → 400
+        registry = load_projects_config(ApiHandler.state.projects_path)
+        proj = next((p for p in registry.get("projects", [])
+                     if isinstance(p, dict) and p.get("id") == project_id), None)
         if proj is None or proj.get("transport", "local") != "agent":
-            # 写入侧闸（契约 §一/§五）：未注册 / 非 agent 传输条目 → 400 不入队
             self._json_error(400, "project 未注册或非 agent 传输条目")
             return
         cmd, reused = ApiHandler.state.downlink.enqueue(
@@ -3482,128 +3252,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         if len(data) > MAX_INGEST_PAYLOAD_BYTES:
             return None, f"payload 超限（上限 {MAX_INGEST_PAYLOAD_BYTES} 字节）"
         return data, None
-
-    # ------------------------------------------------------------------
-    # 下行指令队列 handlers（TASK-035，AGENT-DOWNLINK-CONTRACT §一~§五）
-    # ------------------------------------------------------------------
-    def _downlink_auth(self):
-        """Bearer 鉴权 + 限流；失败时已写响应并返回 None（顺序同 do_POST：先 401 再 429）。"""
-        token = extract_bearer_token(self.headers.get("Authorization", ""))
-        agent_id = resolve_agent_id(ApiHandler.state.agents, token)
-        if agent_id is None:
-            self._json_error(401, "鉴权失败")
-            return None
-        if not ApiHandler.state.rate_limiter.allow(agent_id):
-            self._json_error(429, "请求过于频繁，请稍后重试")
-            return None
-        return agent_id
-
-    def _downlink_enqueue(self):
-        """POST /api/downlink/commands：dispatcher 入队（契约 §二/§五）。
-
-        鉴权 → 限流 → schema（400）→ 注册表闸门（400：未登记 / transport=local）→
-        入队；dedup_key 未终态重复 → 409（extra 带既有 command_id/seq，幂等入队依据）。
-        """
-        agent_id = self._downlink_auth()
-        if agent_id is None:
-            return
-        data, err = self._read_body()
-        if err:
-            self._json_error(413, err)
-            return
-        try:
-            body = json.loads(data.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            self._json_error(400, "请求体不是合法 JSON")
-            return
-        spec = validate_downlink_body(body)
-        if isinstance(spec, str):
-            self._json_error(400, spec)
-            return
-        registry = load_projects_config(ApiHandler.state.projects_path)
-        entry = next((p for p in registry.get("projects", [])
-                      if isinstance(p, dict) and p.get("id") == spec["project_id"]), None)
-        if entry is None:
-            self._json_error(400, "project_id 未登记")
-            return
-        if entry.get("transport") == "local":
-            self._json_error(400, "transport=local 条目不支持下行指令")
-            return
-        row, reused = ApiHandler.state.downlink.enqueue(
-            spec["project_id"], spec["dedup_key"], spec["command"],
-            spec["timeout_secs"], agent_id, time.time())
-        if reused:
-            self._json_error(409, "dedup_key 已有未终态指令",
-                             {"command_id": row["command_id"], "seq": row["seq"]})
-            return
-        self._json({"command_id": row["command_id"], "seq": row["seq"], "status": row["status"]})
-
-    def _downlink_pickup(self):
-        """GET /api/downlink/pickup：agent 拾取（契约 §三）。
-
-        鉴权 → per-token 项目白名单（fail-closed：空集合不下发）→ 回收超时 → 领取。
-        无可领指令 → command=null（等价队列空，不泄露他项目信息）。
-        """
-        agent_id = self._downlink_auth()
-        if agent_id is None:
-            return
-        allowed = authorized_projects(ApiHandler.state.agents, agent_id)
-        cmd = ApiHandler.state.downlink.pickup(allowed, time.time())
-        self._json({"command": cmd})
-
-    def _downlink_result(self, command_id):
-        """POST /api/downlink/commands/{id}/result：agent 回报（契约 §四/§五）。
-
-        鉴权 → schema（400）→ 指令存在（404）→ 项目授权（403）→ 脱敏截断 → 落终态；
-        已终态 → 409 幂等忽略（extra 带既有状态）。
-        """
-        agent_id = self._downlink_auth()
-        if agent_id is None:
-            return
-        data, err = self._read_body()
-        if err:
-            self._json_error(413, err)
-            return
-        try:
-            body = json.loads(data.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            self._json_error(400, "请求体不是合法 JSON")
-            return
-        status = body.get("status")
-        if status not in DOWNLINK_TERMINAL_STATUSES:
-            self._json_error(400, "status 必须是 done/failed/skipped")
-            return
-        try:
-            exit_code = int(body.get("exit_code", -1))
-        except (TypeError, ValueError):
-            self._json_error(400, "exit_code 必须是整数")
-            return
-        row = ApiHandler.state.downlink.get(command_id)
-        if row is None:
-            self._json_error(404, "指令不存在")
-            return
-        if not is_project_authorized(ApiHandler.state.agents, agent_id, row["project_id"]):
-            self._json_error(403, "project_id 不在授权范围")
-            return
-        stored, already = ApiHandler.state.downlink.result(
-            command_id, status, exit_code,
-            scrub_downlink_tail(body.get("stdout_tail", "")),
-            scrub_downlink_tail(body.get("stderr_tail", "")), time.time())
-        if already:
-            self._json_error(409, "指令已终态（幂等忽略）", {"command_id": command_id, "status": stored["status"]})
-            return
-        self._json({"command_id": command_id, "status": stored["status"]})
-
-    def _downlink_status(self, command_id):
-        """GET /api/downlink/commands/{id}：dispatcher 轮询状态（契约 §一/§四）。"""
-        agent_id = self._downlink_auth()
-        if agent_id is None:
-            return
-        row = ApiHandler.state.downlink.get(command_id)
-        if row is None:
-            self._json_error(404, "指令不存在")
-            return
-        self._json({"command": row})
 
     def _ingest(self, agent_id):
         data, err = self._read_body()

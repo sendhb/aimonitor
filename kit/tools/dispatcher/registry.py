@@ -21,7 +21,7 @@ TASK-069：Phase 3 调度器骨架的注册表组件。
       ]
     }
 
-零外部依赖（仅 stdlib）。风格与 kit/tools/agent/agent_config.py 一致。
+零外部依赖（仅 stdlib）。风格与 kit/tools/telemetry/agent_config.py 一致。
 """
 import json
 import os
@@ -107,6 +107,25 @@ def load_registry(path):
 def is_local(entry):
     """本地条目判定：transport 非 agent 即视为本地（v1 只处理本地条目）。"""
     return entry.transport != AGENT_TRANSPORT
+
+
+def load_aimonitor_config(path):
+    """读注册表文件顶层 aimonitor 段（TASK-037，agent 通道接入点）。
+
+    形状：{"projects": [...], "aimonitor": {"server_url": "http://..."}}。
+    段缺失/非法/文件读不到 → {"server_url": None}（不抛——list/scan 照常工作，
+    agent 条目在执行时才报错）；token 绝不入注册表（环境变量 AIOS_DOWNLINK_TOKEN）。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {"server_url": None}
+    section = data.get("aimonitor") if isinstance(data, dict) else None
+    url = section.get("server_url") if isinstance(section, dict) else None
+    if isinstance(url, str) and url.strip():
+        return {"server_url": url.strip().rstrip("/")}
+    return {"server_url": None}
 
 
 def is_agent(entry):

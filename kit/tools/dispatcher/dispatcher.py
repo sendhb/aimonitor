@@ -9,6 +9,12 @@ TASK-074：status/monitor + run 状态机接线（分配指纹/超时回收/重�
 TASK-075：治理挂钩——P0 无 approval-ref / rework-count ≥ 3 → 跳过并告警；
 monitor 上报 blocked/stale 派生信息；allocate/run/dispatch 支持 --dry-run
 （只报治理判定不执行）。
+TASK-037：agent 传输适配器（PHASE3-V2-CROSSMACHINE-DESIGN §五-4）——
+语义命令（task_start/autoloop_coder/autoloop_reviewer）→ LocalAdapter（本地
+subprocess，与 v1 逐字节一致）/ AgentAdapter（aimonitor 指令队列：POST 入队
+dedup_key 幂等、409 复用防双派、轮询至终态；token 经环境变量
+AIOS_DOWNLINK_TOKEN，不入注册表/日志）；scan/allocate/run 的 agent 条目经
+aimonitor /api/status 聚合快照（不再无脑跳过）；A2A 适配器为预留挂载点。
 
 用法:
     python3 kit/tools/dispatcher/dispatcher.py list --config <projects.json>
@@ -21,14 +27,17 @@ monitor 上报 blocked/stale 派生信息；allocate/run/dispatch 支持 --dry-r
     python3 kit/tools/dispatcher/dispatcher.py downlink --config <projects.json> --path <项目路径> --command <cmd> [--arg A]...
 
 - list：项目清单 + transport 标注（local/agent）+ 可达性；
-- scan：只统计本地项目的任务状态（六种计数 + 最近事件）；远端 agent
-  传输条目输出 `skipped(agent-transport)` + stderr 告警；整体 exit 0；
+- scan：本地项目读 runtime/tasks/ 统计（六种计数 + 最近事件）；agent 传输
+  条目经 aimonitor /api/status 聚合读计数（TASK-037）；未配置
+  aimonitor.server_url 或 aimonitor 不可达时输出 skipped/unreachable +
+  stderr 告警；整体 exit 0；
 - allocate：policy 选任务策略 v1（注册表顺序 round-robin、项目内 TASK
   升序、每项目 1 候选、全局 --max-workers 上限），只打印候选不执行；
   治理拦截候选（P0 无 approval-ref / rework-count ≥ 3）打印 [governance] 行；
-- run / dispatch --once：allocate（policy 读 runtime 快照选候选）后对每个
-  候选在项目目录内执行 task start / autoloop-coder --once，输出每条命令的
-  exit code 与输出；指定 --state-dir 时接线调度状态机——超时回收先行、
+- run / dispatch --once：allocate（policy 读 runtime 快照选候选，agent 条目
+  经 aimonitor 聚合快照）后对每个候选执行 task start / autoloop-coder --once
+  ——本地条目 subprocess，agent 条目经 aimonitor 指令队列（适配器抽象，
+  TASK-037），输出每条命令的 exit code 与输出；指定 --state-dir 时接线调度状态机——超时回收先行、
   活跃/人工任务不重复分配、全局并发上限（活跃 + 本轮新启动 ≤ --max-workers）、
   执行结果落盘 done/failed（连续失败 3 次 → human）；
   --dry-run：只报治理判定（[ok]/[governance]/[skip-state]）不执行任何命令、
@@ -57,6 +66,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import agent_adapter as agent_adapter_lib  # noqa: E402
 import downlink as downlink_lib  # noqa: E402
 import monitor as monitor_lib  # noqa: E402
 import policy as policy_lib  # noqa: E402
@@ -66,7 +76,7 @@ import state as state_lib  # noqa: E402
 
 # agent_config 用于 monitor 的推送配置加载（agent.json 形状）；
 # agent_runtime 用于 monitor 的本地项目快照读取（governance blocked 派生）
-AGENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent")
+AGENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "telemetry")
 if AGENT_DIR not in sys.path:
     sys.path.insert(0, AGENT_DIR)
 import agent_config as agent_config_lib  # noqa: E402
@@ -85,6 +95,62 @@ def default_state_dir():
         os.path.dirname(os.path.abspath(__file__))
     )))
     return os.path.join(root, "runtime", "logs", "dispatcher")
+
+
+def _aimonitor_url(args):
+    """注册表顶层 aimonitor.server_url（TASK-037）；缺失 → None（list/scan 兼容旧行为）。"""
+    return registry_lib.load_aimonitor_config(
+        getattr(args, "config", None) or DEFAULT_CONFIG).get("server_url")
+
+
+def _agent_snapshots(args, entries):
+    """agent 条目 → aimonitor 聚合快照（probe.snapshot_from_aimonitor，TASK-037）。
+
+    aimonitor 未配置 → 空表（agent 条目被 policy 跳过，保持 v1 边界）；
+    已配置但不可达/未登记 → stderr 告警 + 跳过该条目（不崩溃）。
+    """
+    url = _aimonitor_url(args)
+    snaps = {}
+    if not url:
+        return snaps
+    for entry in entries:
+        if not registry_lib.is_agent(entry):
+            continue
+        snap = probe_lib.snapshot_from_aimonitor(url, entry)
+        if snap is None:
+            print(f"dispatcher: WARN agent 条目快照不可达（aimonitor 未登记/失联）: "
+                  f"{entry.id}（{entry.path}）", file=sys.stderr)
+            continue
+        snaps[entry.id] = snap
+    return snaps
+
+
+def _evaluated(args, entries):
+    """evaluate_candidates + agent 快照注入（cmd_allocate/dry_run/run 共用，TASK-037）。"""
+    return policy_lib.evaluate_candidates(
+        entries, max_workers=args.max_workers,
+        snapshots=_agent_snapshots(args, entries))
+
+
+def _adapter_for(entry, aimonitor_url):
+    """按条目传输选适配器（TASK-037）：local → LocalAdapter（复用 downlink.run，
+    与 v1 逐字节一致）；agent → AgentAdapter（aimonitor 指令队列）。
+
+    token 从环境变量 AIOS_DOWNLINK_TOKEN 读（Rule of Two：不入注册表/日志/代码）；
+    拾取余量可经 AIOS_DOWNLINK_ACK_MARGIN 覆盖（秒，默认 90；集成验证/烟幕用短值）。
+    agent 配置缺失时 AgentAdapter 报 DownlinkError，由 caller 沿用
+    cmd_run 的干净失败路径（✗ 下行错误 + 标 failed）。
+    """
+    if not registry_lib.is_agent(entry):
+        return agent_adapter_lib.LocalAdapter()
+    try:
+        ack_margin = float(os.environ.get(agent_adapter_lib.ACK_MARGIN_ENV,
+                                          agent_adapter_lib.ACK_MARGIN))
+    except (TypeError, ValueError):
+        ack_margin = agent_adapter_lib.ACK_MARGIN
+    return agent_adapter_lib.AgentAdapter(
+        aimonitor_url, os.environ.get("AIOS_DOWNLINK_TOKEN", ""),
+        ack_margin=ack_margin)
 
 
 def _load_or_die(args):
@@ -112,7 +178,11 @@ def cmd_list(args, entries):
 
 
 def cmd_scan(args, entries):
-    results = probe_lib.scan_projects(entries)
+    aimonitor_url = _aimonitor_url(args)
+    fetcher = None
+    if aimonitor_url:
+        fetcher = (lambda e: probe_lib.fetch_aimonitor_counts(aimonitor_url, e.id))
+    results = probe_lib.scan_projects(entries, status_fetcher=fetcher)
     totals = {status: 0 for status in probe_lib.STATUSES}
     skipped = 0
 
@@ -120,12 +190,17 @@ def cmd_scan(args, entries):
         entry = res["entry"]
         if res["skipped"]:
             skipped += 1
-            print(f"[skipped] {entry.id}  {entry.path}  skipped(agent-transport)")
-            print(
-                f"dispatcher: WARN 远端 agent 传输条目跳过（v1 只处理本地条目）: "
-                f"{entry.id} ({entry.path}) [agent-transport]",
-                file=sys.stderr,
-            )
+            if res.get("reason") == "aimonitor-unreachable":
+                print(f"[unreachable] {entry.id}  {entry.path}  aimonitor 失联")
+                print(f"dispatcher: WARN agent 条目 aimonitor 不可达/未登记，跳过: "
+                      f"{entry.id} ({entry.path})", file=sys.stderr)
+            else:
+                print(f"[skipped] {entry.id}  {entry.path}  skipped(agent-transport)")
+                print(
+                    f"dispatcher: WARN agent 传输条目跳过（未配置 aimonitor.server_url）: "
+                    f"{entry.id} ({entry.path}) [agent-transport]",
+                    file=sys.stderr,
+                )
             continue
 
         counts = res["counts"]
@@ -157,7 +232,7 @@ def cmd_scan(args, entries):
 
 def cmd_allocate(args, entries):
     """打印本轮候选；治理拦截候选（P0 无 approval-ref / rework ≥ 3）打印 [governance]。"""
-    considered = policy_lib.evaluate_candidates(entries, max_workers=args.max_workers)
+    considered = _evaluated(args, entries)
     candidates = [c for c in considered if c.decision == "ok"]
     for c in considered:
         if c.decision != "ok":
@@ -191,50 +266,23 @@ def _print_result(res):
         print(f"  stderr: {err}", file=sys.stderr)
 
 
-def _run_candidate(entry, candidate, timeout=DEFAULT_TIMEOUT):
-    """对单个候选执行标准下行链，返回 [(label, CommandResult), ...]。
+def _run_candidate(entry, candidate, timeout=DEFAULT_TIMEOUT, adapter=None):
+    """对单个候选执行标准下行链（传输无关，TASK-037 适配器抽象），返回
+    [(label, CommandResult), ...]。
 
-    - open：先 task start（本地 CLI 落盘状态），再 autoloop-coder --once；
+    语义命令序列（agent_adapter.candidate_commands）：
+    - open：先 task start（状态落盘），再 autoloop-coder --once；
     - in-progress：autoloop-coder --once（继续实现 + verify）；
     - in-review → autoloop-reviewer --once 是【保留分支】：v1 policy
-      （policy.CANDIDATE_STATUSES）只选 open/in-progress，allocate/run/
-      dispatch 当前不会选到 in-review 候选，该分支仅留给未来 policy
-      扩展（如纳入 in-review + 独立 reviewer 会话约束），故文档保留。
-    只触发既有工具链，不直接写任务文件（硬约束）。
+      只选 open/in-progress，该分支仅留给未来扩展。
+    adapter=None → LocalAdapter（与 v1 逐字节一致）；agent 条目由 cmd_run
+    注入 AgentAdapter。只触发既有工具链，不直接写任务文件（硬约束）。
     """
+    if adapter is None:
+        adapter = agent_adapter_lib.LocalAdapter()
     results = []
-    if candidate.status == "open":
-        results.append(
-            (
-                f"task start {candidate.task_id}",
-                downlink_lib.run(
-                    entry,
-                    sys.executable,
-                    ["kit/cli/task", "start", candidate.task_id],
-                    timeout=timeout,
-                ),
-            )
-        )
-    if candidate.status == "in-review":
-        results.append(
-            (
-                "autoloop-reviewer --once（保留分支，v1 不触发）",
-                downlink_lib.run(
-                    entry, "bash", ["kit/cli/autoloop-reviewer", "--once"],
-                    timeout=timeout,
-                ),
-            )
-        )
-    else:
-        results.append(
-            (
-                "autoloop-coder --once",
-                downlink_lib.run(
-                    entry, "bash", ["kit/cli/autoloop-coder", "--once"],
-                    timeout=timeout,
-                ),
-            )
-        )
+    for name, args_, label in agent_adapter_lib.candidate_commands(candidate):
+        results.append((label, adapter.execute(entry, name, args_, timeout=timeout)))
     return results
 
 
@@ -316,7 +364,7 @@ def cmd_monitor(args, entries):
 def cmd_dry_run(args, entries):
     """--dry-run：只报治理判定（policy 评估 + 状态机可见性），不执行任何命令、
     不修改调度状态。"""
-    considered = policy_lib.evaluate_candidates(entries, max_workers=args.max_workers)
+    considered = _evaluated(args, entries)
     state = None
     state_dir = getattr(args, "state_dir", None)
     if state_dir:
@@ -350,7 +398,7 @@ def cmd_run(args, entries):
     # 治理挂钩（TASK-075 FIND-001 修复）：用 evaluate_candidates 保留被拦截
     # 候选——[governance] 行与 dispatcher.governance-blocked 事件是「跳过并
     # 记录告警」的操作路径（与 cmd_allocate / README 一致），不静默丢弃。
-    considered = policy_lib.evaluate_candidates(entries, max_workers=args.max_workers)
+    considered = _evaluated(args, entries)
     candidates = [c for c in considered if c.decision == "ok"]
     blocked = [c for c in considered if c.decision != "ok"]
     state_dir = getattr(args, "state_dir", None)
@@ -396,7 +444,9 @@ def cmd_run(args, entries):
         cand_failed = False
         fail_reason = ""
         try:
-            results = _run_candidate(c.entry, c)
+            results = _run_candidate(
+                c.entry, c, timeout=getattr(args, "timeout", DEFAULT_TIMEOUT),
+                adapter=_adapter_for(c.entry, _aimonitor_url(args)))
         except downlink_lib.DownlinkError as e:
             # 干净报错（目录被删/命令二进制缺失等），记失败并继续，不抛 traceback
             print(f"  ✗ 下行错误（{c.task_id}）: {e}", file=sys.stderr)

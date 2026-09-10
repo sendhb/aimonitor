@@ -1,6 +1,6 @@
 """monitor.py — 调度事件 + 心跳 → aimonitor（kit/tools/dispatcher/ 观测层）。
 
-TASK-074：调度状态机的可观测性，与 agent（kit/tools/agent/）同构：
+TASK-074：调度状态机的可观测性，与 agent（kit/tools/telemetry/）同构：
 - 心跳：`state_dir/dispatcher.heartbeat`（内容为 epoch 秒，mtime 同样可判活，
   与 autoloop-*.heartbeat 语义一致——监控端靠 mtime 判断调度器是否卡死）。
 - 事件流：`state_dir/dispatcher-events.jsonl`（state.py 追加写入），按游标
@@ -14,7 +14,7 @@ TASK-074：调度状态机的可观测性，与 agent（kit/tools/agent/）同�
 - 未配置 server_url/token（--monitor-config 缺省）→ dry-run：只写心跳与本地
   事件，不推送、不推进游标。
 
-零外部依赖（仅 stdlib + ../agent/ 的 agent_payload/agent_http/agent_config）。
+零外部依赖（仅 stdlib + ../telemetry/ 的 agent_payload/agent_http/agent_config）。
 """
 import json
 import os
@@ -22,9 +22,9 @@ import re
 import sys
 import time
 
-# 复用 agent 的 payload/HTTP 推送层（同目录层级：kit/tools/dispatcher/ → ../agent/）
+# 复用 agent 的 payload/HTTP 推送层（同目录层级：kit/tools/dispatcher/ → ../telemetry/）
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "telemetry"
 )
 if AGENT_DIR not in sys.path:
     sys.path.insert(0, AGENT_DIR)

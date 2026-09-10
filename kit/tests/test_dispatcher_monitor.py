@@ -22,7 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISPATCHER_PY = os.path.join(DISPATCHER_DIR, "dispatcher.py")
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 sys.path.insert(0, DISPATCHER_DIR)
@@ -207,7 +207,7 @@ class MonitorCliTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, DISPATCHER_PY, *extra, "--config", self.cfg,
              "--state-dir", self.state_dir],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
 
     def test_cli_monitor_dry_run_writes_heartbeat(self):

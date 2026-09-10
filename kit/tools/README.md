@@ -8,7 +8,8 @@
 
 | 工具 | 能力 | 接口 |
 |------|------|------|
-| `agent/` | AIOS 遥测推送（读被监控项目 runtime/ 状态 → 按间隔推送 ingest，含退避） | `python3 kit/tools/agent/agent.py [--once] [--interval N] [--quiet]`（配置见 `agent.json`） |
+| `telemetry/` | AIOS 遥测推送（读被监控项目 runtime/ 状态 → 按间隔推送 ingest，含退避） | `python3 kit/tools/telemetry/agent.py [--once] [--interval N] [--quiet]`（配置见 `agent.json`） |
+| `mcp/` | 能力层 MCP server：task 状态机 + 上下文装配，宿主 CLI 原生工具调用（TASK-097） | `python3 kit/tools/mcp/server.py [--root DIR]`（stdio JSON-RPC 2.0，见 [`mcp/README.md`](mcp/README.md)） |
 | `git/` | 版本控制（commit/branch/diff/checkpoint） | `git add/commit/push`, `git diff --stat`, `git stash` |
 | `filesystem/` | 文件读写、目录遍历 | read/write/edit/ls |
 | `shell/` | 命令行执行（编译/测试/构建） | bash <command> |

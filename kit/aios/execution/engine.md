@@ -150,6 +150,14 @@ print(impact.risk_level)        # 如: P1
 - [ ] 测试是否覆盖了关键路径?
 - [ ] 错误处理是否完整?
 
+**机械项（cli/reflect）**：上述清单中"是否引入技术债"与"是否越界改动"两项可机械化——运行
+`python3 kit/cli/reflect <TASK-ID> --base <ref>`（默认 HEAD~1..HEAD），机械扫描 git diff：新增行命中
+技术债标记（TODO/FIXME/HACK/XXX，逐文件逐行号）、改动文件 ∉ `source_dirs` 或 ∈ `generated_dirs`
+→ 越界告警（指明目录属性）。产出 markdown REFLECT 记录段（贴回 TASK 备注）；**无发现输出严格为"无"**
+（防样板发现）。reflect 产出是**建议**，不进状态机否决链——机械否决权只在 §5 verify 与治理闸门
+（P0/rework）。判断性自省（架构违规/测试覆盖/规格对齐）仍由模型完成，保持"机械管纪律、prompt 管判断"
+的分工边界。
+
 **SDD 任务额外自省(规格变更):**
 - [ ] 实现是否与更新后的规格逐项对齐?(逐字段/逐端点/逐消息对照)
 - [ ] 是否有规格写了但未实现的端点/字段/消息?

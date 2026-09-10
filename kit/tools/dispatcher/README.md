@@ -8,8 +8,9 @@
 
 | 模块 | 职责 | 任务 |
 |------|------|------|
-| `registry.py` | 读 `aimonitor/config/projects.json` 注册表，暴露 transport（缺失默认 local）；`is_local(entry)` 判定本地条目 | TASK-069 |
-| `probe.py` | 只读探测本地项目 `runtime/tasks/` 状态（六种计数 + 最近事件）；复用 `../agent/agent_runtime.py`；agent 条目标记 skipped | TASK-069 |
+| `registry.py` | 读 `aimonitor/config/projects.json` 注册表，暴露 transport（缺失默认 local）；`is_local(entry)`/`is_agent(entry)`；顶层 `aimonitor.server_url`（agent 通道地址，TASK-037） | TASK-069/037 |
+| `probe.py` | 只读探测项目状态（六种计数 + 最近事件）；本地条目读 `runtime/tasks/`（复用 `../agent/agent_runtime.py`）；agent 条目经 aimonitor `/api/status` 聚合（TASK-037，不再无脑 skip；未配 aimonitor 或失联时仍 skipped + 告警） | TASK-069/037 |
+| `agent_adapter.py` | 下行传输适配器抽象：语义命令（task_start/autoloop_coder/autoloop_reviewer）→ LocalAdapter（本地 subprocess，与 v1 逐字节一致）/ AgentAdapter（aimonitor 指令队列：dedup_key 幂等入队、409 复用防双派、轮询至终态、等待超时 timed_out）；A2A 适配器为预留挂载点 | TASK-037 |
 | `policy.py` | 选任务策略 v1：注册表顺序 round-robin、项目内 TASK 升序、每项目 1 候选、全局 `--max-workers` 上限；治理判定（P0 无 approval-ref / rework ≥ 3 → 拦截） | TASK-073/075 |
 | `governance.py` | 治理判定：P0 无 approval-ref → p0-blocked；rework-count ≥ 3 → rework-rejected（机械执行，单源） | TASK-075 |
 | `downlink.py` | 本地 subprocess 下行适配器：校验路径属于注册表 → 在项目目录执行命令 → 收集 exit code/输出 | TASK-073 |
@@ -17,9 +18,12 @@
 | `monitor.py` | 调度事件 + 心跳 → aimonitor（与 agent 同构：`dispatcher.heartbeat` + `dispatcher-events.jsonl` 增量推送）；payload 含 governance 派生（blocked/stale 告警） | TASK-074/075 |
 | `dispatcher.py` | CLI 入口：`list` / `scan` / `allocate` / `run` / `dispatch --once` / `status` / `monitor` / `downlink`；`--dry-run` 只报治理判定不执行 | TASK-069/073/074/075 |
 
-边界（v1 注册表处理边界，见设计稿 §三）：
-- **只处理同机本地条目**（transport 为空/默认）：probe 直接读 runtime/tasks/，downlink 本地执行。
-- **远端 agent 传输条目**（`"transport": "agent"`，如 `D:/share/*`）：跳过 + 告警，不尝试读不存在的路径 / 不做本地 subprocess。
+边界（传输处理边界，TASK-037 更新）：
+- **同机本地条目**（transport 为空/默认）：probe 直接读 runtime/tasks/，downlink 本地执行（LocalAdapter）。
+- **远端 agent 传输条目**（`"transport": "agent"`，如 `D:/share/*`）：下行走 aimonitor 指令队列（AgentAdapter），
+  probe/候选经 aimonitor `/api/status` 聚合快照；注册表顶层需 `"aimonitor": {"server_url": "http://<hub>:<port>"}`，
+  token 从环境变量 `AIOS_DOWNLINK_TOKEN` 读取（不入注册表/日志）；未配 aimonitor 或失联 → skipped/unreachable + 告警（保持可观测）。
+- **中央不直写远端 FS**（v1 铁律不变）：agent 条目的执行仍由目标机 agent 拾取指令后本地执行（含双重白名单闸）。
 
 ## 使用（CLI）
 
@@ -29,8 +33,11 @@ CFG=/home/hb/code/aimonitor/config/projects.json
 # 项目清单：id / path / transport / 可达性
 python3 kit/tools/dispatcher/dispatcher.py list --config $CFG
 
-# 本地项目任务状态统计 + agent 条目跳过告警
+# 本地项目读 runtime/tasks/ 统计；agent 条目经 aimonitor 聚合出计数（未配 aimonitor → skipped 告警）
 python3 kit/tools/dispatcher/dispatcher.py scan --config $CFG
+
+# agent 通道 token（agent 条目执行需要；不入文件）
+export AIOS_DOWNLINK_TOKEN=<dispatcher-token>
 
 # 选任务策略 v1：打印候选（不执行）；--max-workers 全局并发上限
 python3 kit/tools/dispatcher/dispatcher.py allocate --config $CFG --max-workers 1
@@ -69,13 +76,18 @@ python3 kit/tools/dispatcher/dispatcher.py downlink --config $CFG \
 
 - `--config` 默认 `~/code/aimonitor/config/projects.json`。
 - `list` 输出 10 条注册，本地条目标 `local`，`D:/share/*` 标 `agent`。
-- `scan` 只统计本地项目（六种计数 + 最近事件）；agent 条目 `skipped(agent-transport)` + stderr 告警；整体 exit 0。
+- `scan` 本地项目读 runtime/tasks/（六种计数 + 最近事件）；agent 条目经 aimonitor `/api/status` 聚合出计数（TASK-037）；
+  未配 aimonitor.server_url → `skipped(agent-transport)`、失联 → `[unreachable]`，均 stderr 告警；整体 exit 0。
 - `allocate`：policy v1 只选 open/in-progress、项目内 TASK 编号升序、每项目最多 1 个候选、累计不超过 `--max-workers`。
-- `run` / `dispatch --once`：policy 读 runtime 快照选候选（allocate），对每个候选执行下行链——
-  - open → `task start <id>` + `autoloop-coder --once`
-  - in-progress → `autoloop-coder --once`
-  - in-review → `autoloop-reviewer --once`（**保留分支**：v1 policy 只选
+- `run` / `dispatch --once`：policy 读 runtime 快照选候选（本地条目读 `runtime/tasks/`，agent 条目经 aimonitor 聚合快照），
+  对每个候选执行语义命令链（agent_adapter.candidate_commands）——
+  - open → `task_start`（`task start <id>`）+ `autoloop_coder`（`autoloop-coder --once`）
+  - in-progress → `autoloop_coder`
+  - in-review → `autoloop_reviewer`（**保留分支**：v1 policy 只选
     open/in-progress，allocate/run/dispatch 当前不会触发，仅留给未来 policy 扩展）
+  本地条目 → LocalAdapter（subprocess，行为同 v1）；agent 条目 → AgentAdapter
+  （aimonitor 指令队列：dedup_key 幂等入队，409 复用在途指令防双派，轮询至终态，
+  等待超时 timed_out → state.py stale 回收语义与本地一致）。
   只触发既有工具链，不直接写任务文件（中央不直写远端 FS）。
 - **治理挂钩（TASK-075）**：跨项目继承单项目分级治理——
   - P0 任务（priority/risk 任一 P0）无有效 `approval-ref` → 不分配（blocked 语义），
@@ -87,10 +99,14 @@ python3 kit/tools/dispatcher/dispatcher.py downlink --config $CFG \
 - `downlink`：先校验 `--path` 属于注册表（规范化路径精确匹配，`../` 伪造无效；agent 条目拒绝），再在项目目录执行命令。
 - 注册表路径不存在 / 格式错误 → stderr 明确报错 + exit 1。
 
-## 安全边界（TASK-073）
+## 安全边界（TASK-073 / TASK-037）
 
 - downlink 只调 `task`/`autoloop-*` CLI，不直接写任何任务文件。
-- 执行前校验项目路径：非注册表路径 / agent 传输条目 / 目录不存在 → DownlinkError，报错退出不执行。
+- 执行前校验项目路径：非注册表路径 / 目录不存在 → DownlinkError，报错退出不执行；
+  手动 `downlink` 子命令对 agent 传输条目仍拒绝（本地执行越权），agent 条目请用 `run`/`dispatch`（走指令队列）。
+- 语义命令白名单（TASK-037）：dispatcher 侧只发 task_start / autoloop_coder / autoloop_reviewer
+  （与 agent 侧白名单各自独立枚举，防一处被改两处失守）；白名单外命令在任何适配器上直接拒绝。
+- dispatcher token 只经 Authorization 头传递（环境变量 `AIOS_DOWNLINK_TOKEN`），不入注册表/日志/代码（Rule of Two）。
 - 失败以 exit code + stdout/stderr 回报，不静默吞错。
 
 ## 状态机（TASK-074）

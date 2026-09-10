@@ -46,8 +46,12 @@ import sys
 print("fake-task", *sys.argv[1:])
 sys.exit(0)
 """
-FAKE_CODER_SH = """#!/usr/bin/env bash
-echo "fake-autoloop-coder once"
+# autoloop-coder 入口自 TASK-026 起是 Python 薄 shim，dispatcher 以
+# sys.executable 调用（不再经 bash），假脚本同步为 Python。
+FAKE_CODER_PY = """#!/usr/bin/env python3
+import sys
+print("fake-autoloop-coder", *sys.argv[1:])
+sys.exit(0)
 """
 
 
@@ -83,7 +87,7 @@ def make_local_project(root, project, status="open"):
     proj = os.path.join(root, project)
     make_task(root, project, "TASK-001", status)
     write_file(os.path.join(proj, "kit", "cli", "task"), FAKE_TASK_PY)
-    write_file(os.path.join(proj, "kit", "cli", "autoloop-coder"), FAKE_CODER_SH,
+    write_file(os.path.join(proj, "kit", "cli", "autoloop-coder"), FAKE_CODER_PY,
                mode=0o755)
     return proj
 
@@ -292,7 +296,7 @@ class DispatcherStatusCliTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, DISPATCHER_PY, *extra, "--config", self.cfg,
              "--state-dir", self.state_dir],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
 
     def _make_state(self, status="running", started_at=None, retry_count=0):
@@ -363,7 +367,7 @@ class DispatcherConcurrencyCliTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, DISPATCHER_PY, *extra, "--config", self.cfg,
              "--state-dir", self.state_dir],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
 
     def _make_running_state(self, project="proj-a", task="TASK-001"):

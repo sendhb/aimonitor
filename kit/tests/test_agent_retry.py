@@ -1,4 +1,4 @@
-"""TASK-026 — kit/tools/agent/ 重试退避状态机单测。
+"""TASK-026 — kit/tools/telemetry/ 重试退避状态机单测。
 
 覆盖：
 - 指数退避序列：1→2→4→8→16→32→60→60（cap 后恒定，不再增长）
@@ -18,7 +18,7 @@ import time
 import unittest
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 import agent_retry  # noqa: E402

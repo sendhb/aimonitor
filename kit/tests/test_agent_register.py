@@ -1,4 +1,4 @@
-"""TASK-042/043 — kit/tools/agent/ 注册状态机与轮询单测。
+"""TASK-042/043 — kit/tools/telemetry/ 注册状态机与轮询单测。
 
 TASK-042 覆盖：
 - RegistrationState.load() 正确读取 agent.json
@@ -29,7 +29,7 @@ import time
 import unittest
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

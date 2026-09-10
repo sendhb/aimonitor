@@ -45,8 +45,12 @@ import sys
 print("fake-task", *sys.argv[1:])
 sys.exit(0)
 """
-FAKE_CODER_SH = """#!/usr/bin/env bash
-echo "fake-autoloop-coder once"
+# autoloop-coder 入口自 TASK-026 起是 Python 薄 shim，dispatcher 以
+# sys.executable 调用（不再经 bash），假脚本同步为 Python。
+FAKE_CODER_PY = """#!/usr/bin/env python3
+import sys
+print("fake-autoloop-coder", *sys.argv[1:])
+sys.exit(0)
 """
 
 
@@ -65,7 +69,7 @@ def make_local_project(root, project):
     write_file(os.path.join(proj, "runtime", "tasks", f"{name}.md"),
                TASK_TPL.format(name=name, status="open"))
     write_file(os.path.join(proj, "kit", "cli", "task"), FAKE_TASK_PY)
-    write_file(os.path.join(proj, "kit", "cli", "autoloop-coder"), FAKE_CODER_SH,
+    write_file(os.path.join(proj, "kit", "cli", "autoloop-coder"), FAKE_CODER_PY,
                mode=0o755)
     return proj
 
@@ -180,7 +184,7 @@ class DispatcherCliTests(unittest.TestCase):
     def _run(self, *extra):
         return subprocess.run(
             [sys.executable, DISPATCHER_PY, *extra, "--config", self.cfg],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
 
     def test_allocate_prints_candidates_only_one_with_max_workers_1(self):
@@ -211,7 +215,7 @@ class DispatcherCliTests(unittest.TestCase):
             [sys.executable, DISPATCHER_PY, "downlink",
              "--config", self.cfg, "--path", fake,
              "--command", "echo", "--arg", "forged"],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("拒绝", proc.stderr)

@@ -36,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

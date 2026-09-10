@@ -60,7 +60,7 @@ open → in-progress → in-review → done
 1. 读 boot + TASK + 相关模块，制定计划
 2. 实现（只改 source_dirs）
 3. `./kit/cli/task verify TASK-xxx`（真实执行，不手写 VERIFY）
-4. 通过后：fast-path → `task done`；完整路径 → `task review`
+4. 通过后：fast-path → `task done`；完整路径 → `task review`（转 review 前先在 front-matter 指定 reviewer，否则 `task review` 会 die——TASK-101 硬拦截）
 5. 完整路径任务**不自行 approve/done**（生成者 ≠ 审查者）
 6. 需动 P0 文件 → `task block` 等人工，不继续实现
 
@@ -87,3 +87,12 @@ open → in-progress → in-review → done
 - `task` 是 Python 3，勿用 bash 调用（见 §2）。
 - 不手写 VERIFY/REVIEW 冒充证据（`task verify` / reviewer 会话才生成）。
 - 生成代码改了规格不生效 → 改规格 → `config.commands.generate` 重新生成。
+
+## 12. Token 节约（强制）
+
+- **最小读取**：只读 TASK + 涉及模块；禁止全仓扫描、禁止 knowledge/ 通读。
+- **verify 失败**：只读 `runtime/logs/fail-<date>.tail`（如存在）或 `fail-<date>.log` 最后 100 行，禁止全量读日志。
+- **Coder 提交 review 前**：逐条对照验收标准自检，确认每条可验证满足；无法确认先修复再 verify。
+- **Reviewer 审查前**：先运行 `python3 kit/cli/lib/review_context.py <task>` 获取任务元数据、VERIFY 记录、git diff 摘要；禁止全仓扫描。
+- **P2 审查前**：先运行 `python3 kit/cli/lib/p2_review_check.py <task>`，自动检查项以脚本输出为准。
+- **P2 三问不扩展**：不自由审计，不做额外扩展检查；无真实问题就写“无”，不制造样板发现。

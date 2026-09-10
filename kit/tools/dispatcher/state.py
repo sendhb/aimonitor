@@ -19,7 +19,7 @@ frontmatter rework-count ≥ 3 → 拒绝转人工），跨项目下治理闸门
   runtime/tasks/ 重建——in-progress 任务恢复为 running 分配（worker=
   recovered，起点取 heartbeat mtime 或当前时间），kill 后重启恢复认知。
 
-零外部依赖（仅 stdlib + 复用 ../agent/agent_runtime.py 只读层）。
+零外部依赖（仅 stdlib + 复用 ../telemetry/agent_runtime.py 只读层）。
 写文件原子化（tmp + os.replace），与 agent_runtime.write_push_cursor 一致。
 """
 import json
@@ -29,9 +29,9 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 
-# 复用 agent_runtime 的只读层（同目录层级：kit/tools/dispatcher/ → ../agent/）
+# 复用 agent_runtime 的只读层（同目录层级：kit/tools/dispatcher/ → ../telemetry/）
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "telemetry"
 )
 if AGENT_DIR not in sys.path:
     sys.path.insert(0, AGENT_DIR)

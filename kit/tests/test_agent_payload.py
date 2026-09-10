@@ -1,4 +1,4 @@
-"""TASK-024 — kit/tools/agent/ payload 构造与序列化单测。
+"""TASK-024 — kit/tools/telemetry/ payload 构造与序列化单测。
 
 覆盖：
 - 字段完整：完整快照 → project_id/ts/files 六字段齐全；全 None 快照 → 字段仍齐全；快照缺键 → 字段为 None
@@ -15,7 +15,7 @@ import time
 import unittest
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 import agent_payload  # noqa: E402

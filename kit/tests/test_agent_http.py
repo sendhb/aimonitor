@@ -1,4 +1,4 @@
-"""TASK-025 — kit/tools/agent/ HTTP 推送客户端单测。
+"""TASK-025 — kit/tools/telemetry/ HTTP 推送客户端单测。
 
 覆盖：
 - 请求形状：POST /api/ingest、Authorization: Bearer <token>、Content-Type: application/json、
@@ -23,7 +23,7 @@ import unittest.mock as mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 import agent_http  # noqa: E402

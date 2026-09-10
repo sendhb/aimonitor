@@ -34,7 +34,7 @@ def _find_repo_root(start):
 
 
 REPO_ROOT = _find_repo_root(os.path.dirname(os.path.abspath(__file__)))
-AGENT_SCRIPT = os.path.join(REPO_ROOT, "kit", "tools", "agent", "agent.py")
+AGENT_SCRIPT = os.path.join(REPO_ROOT, "kit", "tools", "telemetry", "agent.py")
 
 EXPECTED_FILES_KEYS = ("tasks", "focus", "heartbeats", "events",
                        "verification_count", "review_count")

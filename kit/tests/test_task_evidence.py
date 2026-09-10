@@ -103,6 +103,8 @@ class CmdDoneTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
+        self._orig_ai = task.AI_DIR
+        task.AI_DIR = str(root)  # EVAL-001（TASK-093 审查）：cmd_done 采集钩子 root=AI_DIR，不隔离会污染真实 kit/evaluation
         task.VERIFY_DIR = str(root / "verification")
         task.REVIEW_DIR = str(root / "reviews")
         task.TASKS_DIR = str(root / "tasks")
@@ -115,6 +117,7 @@ class CmdDoneTests(unittest.TestCase):
         Path(task.LOG_DIR).mkdir()
 
     def tearDown(self):
+        task.AI_DIR = self._orig_ai
         self.tmp.cleanup()
 
     def test_cmd_done_does_not_raise_nameerror(self):

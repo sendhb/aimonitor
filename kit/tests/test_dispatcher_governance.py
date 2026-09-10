@@ -290,7 +290,9 @@ class GovernanceCliTests(unittest.TestCase):
                        "import sys\n"
                        "print('fake-task', *sys.argv[1:])\n", mode=0o755)
             write_file(os.path.join(p, "kit", "cli", "autoloop-coder"),
-                       "#!/usr/bin/env bash\necho 'SHOULD-NOT-RUN'\n", mode=0o755)
+                       "#!/usr/bin/env python3\n"
+                       "import sys\n"
+                       "print('SHOULD-NOT-RUN', *sys.argv[1:])\n", mode=0o755)
         make_task(self._tmp.name, "proj-ok", "TASK-001", priority="P2", risk="P2")
         make_task(self._tmp.name, "proj-blocked", "TASK-001", priority="P0",
                   risk="P0", approval="none")
@@ -308,7 +310,7 @@ class GovernanceCliTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, DISPATCHER_PY, *extra, "--config", self.cfg,
              "--state-dir", self.state_dir],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
 
     def test_dispatch_dry_run_reports_decisions_and_does_not_execute(self):

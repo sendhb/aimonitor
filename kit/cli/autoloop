@@ -1,289 +1,32 @@
-#!/usr/bin/env bash
-# ============================================================
-# autoloop — autoloop-coder / autoloop-reviewer 一键启动器
-#
-# 省去每次手敲完整路径与默认参数。在项目根运行：
-#
-#   bash kit/cli/autoloop coder                # 启动 coder（默认 --once --llm pi）
-#   bash kit/cli/autoloop reviewer             # 启动 reviewer（默认 --once --llm pi）
-#   bash kit/cli/autoloop both                 # 顺序执行：coder → reviewer（独立会话）
-#   bash kit/cli/autoloop coder --interval 300 # 追加参数透传（覆盖默认）
-#
-# 默认值:
-#   --once            只跑一轮（不常驻轮询）
-#   --llm ${AIOS_LLM:-pi}   默认 pi（deepseek-v4-flash）；可用 AIOS_LLM 覆盖
-#                         （--llm 显式传入时优先生效）
-#
-# both 模式说明（顺序，非并发）:
-#   coder 先实现（verify → review，任务进 in-review），随后 reviewer 独立会话
-#   审查并 approve。两个循环是【不同 LLM 会话/进程】，满足"生成者 ≠ 审查者"；
-#   并发启动会让 reviewer 在 coder 完成前空跑，故设计为顺序执行。
-#
-# 防重复进程（每角色一把锁，TASK-012 纯 Python 跨平台锁）:
-#   并发唯一权威 = 各角色脚本（autoloop-coder/autoloop-reviewer）内层自锁
-#   （lib/lock.py hold，AIOS_LOCK_HELD=1 重入，持锁覆盖整个运行期）。
-#   本启动器只做非阻塞 probe 前置检查（友好报错）；probe 与执行之间的
-#   竞态由内层自锁兜底（拒绝并 exit 1）。
-#   不再依赖 util-linux flock：Git Bash/MSYS 原生可跑（Windows 用
-#   msvcrt.locking，POSIX 用 fcntl.flock，均为 OS 原生文件锁）。
-#
-# 自动按 shebang 选择解释器（bash / python3），避免用错解释器报错。
-#
-# 常驻模式（both 默认行为）:
-#   both 无参数 = 常驻并【自动后台化】：前台抢锁后立即返回（无需 nohup &），
-#   循环写入 runtime/logs/autoloop-both.log，PID 存 runtime/locks/autoloop-both.pid。
-#   每 ${AUTOLOOP_DEFAULT_INTERVAL:-30}s 一轮 {coder --once → reviewer --once}。
-#   coder 一轮内有任务会阻塞直到该任务完成（verify→review），无任务则快速跳过。
-#   both --once = 前台单轮；both --interval N = 改常驻频率。停止:
-#     kill $(cat runtime/locks/autoloop-both.pid)
-# ============================================================
-set -euo pipefail
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+autoloop — Python 版 autoloop 启动器薄入口（TASK-025，迁移设计 TASK-090）
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+实现位于 kit/cli/lib/autoloop_launcher.py（可 import / 可单独运行）；
+本文件只做 sys.path 接线 + 入口分发，方便 `python kit/cli/autoloop coder` 调用。
 
-# python 解释器分派（TASK-002/TASK-012）：Windows 无 python3（Store stub）时用 python。
-# shellcheck source=cli/lib/pick_python.sh
-source "$SELF_DIR/lib/pick_python.sh"
-PY="$(pick_python)" || {
-  echo "✗ 需要 python3 或 python（进程锁依赖，lib/lock.py）" >&2
-  exit 1
-}
-LOCKPY="$SELF_DIR/lib/lock.py"
+用法（与旧 Bash 版一致）:
+  python kit/cli/autoloop coder                # 启动 coder（默认 --once --llm pi）
+  python kit/cli/autoloop reviewer             # 启动 reviewer（默认 --once --llm pi）
+  python kit/cli/autoloop both                 # 默认后台常驻：coder → reviewer 顺序
+  python kit/cli/autoloop both --once          # 前台单轮
+  python kit/cli/autoloop both --foreground    # 前台常驻（Ctrl-C 停止）
+  python kit/cli/autoloop stop                 # 停止本项目常驻 both 实例
+  python kit/cli/autoloop status               # 单屏聚合：壳死活/LLM 子进程/in-progress/最近事件
+  python kit/cli/autoloop ensure               # 看门狗：幂等探活+拉起（供定时器高频调用，TASK-107）
+  python kit/cli/autoloop coder --interval 300 # 常驻轮询（覆盖默认单轮）
 
-usage() {
-  echo "用法: autoloop <coder|reviewer|both|stop> [--interval N] [--llm L] [--id ID] [--timeout S] [--unattended]" >&2
-  echo "      autoloop both [--once]                             # 默认常驻；--once 只跑单轮" >&2
-  echo "      autoloop both [--coder-llm L1] [--reviewer-llm L2]   # 分角色 LLM（仅 both）" >&2
-  echo "      autoloop both --foreground                       # 前台常驻（配合 tmux 看实时输出）" >&2
-  echo "      autoloop stop                                      # 停止本项目常驻 both 实例" >&2
-  echo "默认: both 无参数 = 常驻并自动后台（日志 runtime/logs/autoloop-both.log）；--once 前台单轮" >&2
-  echo "      coder/reviewer 单模式默认单轮（--once）" >&2
-  echo "注意: autoloop 是 bash 脚本（用 bash 调用正确）；但 cli/task 是 Python 3，" >&2
-  echo "      用 python kit/cli/task 调用（Windows 无 python3 时；Linux 也可 ./kit/cli/task），" >&2
-  echo "      勿用 bash kit/cli/task" >&2
-  echo "      （bash 会把 Python 源码当 shell 逐行解析，产生巨量输出并死循环，脚本已自带防护）。" >&2
-  exit 1
-}
+注意: 本文件是 Python 3 脚本（与 cli/task 一致），用 `python kit/cli/autoloop`
+调用（Windows 无 python3；Linux 也可 ./kit/cli/autoloop）；**不要用 bash
+kit/cli/autoloop**（bash 会把 Python 源码当 shell 逐行解析，产生巨量输出并
+死循环，脚本已自带防护）。
+"""
+import os
+import sys
 
-# 解析 per-role LLM（仅 both 使用）：输出全局 CODER_LLM / REVIEWER_LLM / REST
-CODER_LLM=""
-REVIEWER_LLM=""
-REST=()
-parse_role_llm() {
-  CODER_LLM=""; REVIEWER_LLM=""; REST=()
-  local args=("$@") i=0
-  while [ $i -lt ${#args[@]} ]; do
-    case "${args[$i]}" in
-      --coder-llm)   CODER_LLM="${args[$((i+1))]:-}"; i=$((i+2)) ;;
-      --reviewer-llm) REVIEWER_LLM="${args[$((i+1))]:-}"; i=$((i+2)) ;;
-      *) REST+=("${args[$i]}"); i=$((i+1)) ;;
-    esac
-  done
-}
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+from autoloop_launcher import main  # noqa: E402
 
-# 构造单角色参数：per-role LLM 优先（剥掉 REST 中已有 --llm 对），否则原样透传
-ROLE_ARGS=()
-build_role_args() {
-  local role_llm="$1"; shift
-  local args=("$@") i=0
-  ROLE_ARGS=()
-  if [ -n "$role_llm" ]; then
-    while [ $i -lt ${#args[@]} ]; do
-      if [ "${args[$i]:-}" = "--llm" ]; then i=$((i+2)); continue; fi
-      ROLE_ARGS+=("${args[$i]}"); i=$((i+1))
-    done
-    ROLE_ARGS+=(--llm "$role_llm")
-  else
-    ROLE_ARGS=("${args[@]}")
-  fi
-}
-
-# 解析 --interval（both 常驻用）：输出全局 INTERVAL / ARGS_NO_INTERVAL
-INTERVAL=""
-ARGS_NO_INTERVAL=()
-strip_interval() {
-  INTERVAL=""; ARGS_NO_INTERVAL=()
-  local args=("$@") i=0
-  while [ $i -lt ${#args[@]} ]; do
-    if [ "${args[$i]:-}" = "--interval" ]; then
-      INTERVAL="${args[$((i+1))]:-}"; i=$((i+2))
-    else
-      ARGS_NO_INTERVAL+=("${args[$i]}"); i=$((i+1))
-    fi
-  done
-}
-# 项目根：从 cwd 向上找 aios.config.yaml（锁文件放在 runtime/locks/）
-ROOT="$(pwd)"
-while [ ! -f "$ROOT/aios.config.yaml" ] && [ "$ROOT" != "/" ]; do
-  ROOT="$(dirname "$ROOT")"
-done
-if [ ! -f "$ROOT/aios.config.yaml" ]; then
-  echo "✗ 未找到项目根（aios.config.yaml），请到项目目录内运行" >&2
-  exit 1
-fi
-
-run_locked() {
-  local mode="$1"; shift
-  local script="$SELF_DIR/autoloop-$mode"
-  if [ ! -f "$script" ]; then
-    echo "✗ autoloop-$mode 不存在（$script）" >&2
-    exit 1
-  fi
-
-  local lockdir="$ROOT/runtime/locks"
-  mkdir -p "$lockdir"
-  local lockfile="$lockdir/autoloop-$mode.lock"
-
-  # 非阻塞抢锁探测：已有实例在跑则拒绝启动（内层自锁才是权威，这里仅友好报错）
-  if ! "$PY" "$LOCKPY" probe "$lockfile" 2>/dev/null; then
-    echo "✗ autoloop-$mode 已有实例在运行（$lockfile）——拒绝启动，避免重复进程。" >&2
-    echo "  等当前实例结束再试；确属残留锁可删掉该文件。" >&2
-    return 1
-  fi
-
-  local interp
-  interp="$(head -1 "$script" | grep -oE '(bash|python3)$' | head -1 || true)"
-  [ -n "$interp" ] || interp=bash
-
-  local args=()
-  # 默认 --once（跑一轮即退）；用户显式传 --interval 时进入常驻循环，不再强制 --once
-  if ! printf '%s\n' "$@" | grep -qE '^--interval'; then
-    args+=(--once)
-  fi
-  if ! printf '%s\n' "$@" | grep -qE '^--llm'; then
-    args+=(--llm "${AIOS_LLM:-pi}")
-  fi
-  args+=("$@")
-
-  echo "▶ $interp autoloop-$mode ${args[*]}"
-  # 直接运行子脚本；并发唯一权威 = 子脚本内层自锁（lib/lock.py hold，
-  # AIOS_LOCK_HELD=1 重入，持锁覆盖整个运行期，直接执行本脚本同样生效）。
-  "$interp" "$script" "${args[@]}"
-}
-
-MODE="${1:-}"
-if [ -z "$MODE" ]; then
-  usage
-fi
-shift
-
-case "$MODE" in
-  stop)
-    # 停止本项目常驻 both 实例（PID 文件 + 锁双确认）
-    lockdir="$ROOT/runtime/locks"
-    pidfile="$lockdir/autoloop-both.pid"
-    if [ -f "$pidfile" ]; then
-      PID="$(cat "$pidfile" 2>/dev/null || echo 0)"
-      if [ "$PID" -gt 0 ] 2>/dev/null && kill -0 "$PID" 2>/dev/null; then
-        kill "$PID" 2>/dev/null || true
-        for _ in 1 2 3 4 5; do
-          kill -0 "$PID" 2>/dev/null || break
-          sleep 1
-        done
-        if kill -0 "$PID" 2>/dev/null; then
-          kill -9 "$PID" 2>/dev/null || true
-          echo "⚠ 进程 $PID 未在 5s 内正常退出，已强制 kill" >&2
-        else
-          echo "✓ autoloop both 已停止（PID $PID）"
-        fi
-      else
-        echo "· 进程 $PID 已不在运行（清理过期 PID 文件）"
-      fi
-      rm -f "$pidfile"
-    else
-      if [ -f "$lockdir/autoloop-both.lock" ] && ! "$PY" "$LOCKPY" probe "$lockdir/autoloop-both.lock" 2>/dev/null; then
-        echo "⚠ 锁被占用但无 PID 文件，无法定位进程（可能是旧版启动的实例或残留锁）。" >&2
-        echo "  可用 ps aux | grep autoloop 查找并 kill 对应 PID；锁可删 $lockdir/autoloop-both.lock" >&2
-      else
-        echo "· 本项目没有运行中的 autoloop both 实例"
-      fi
-    fi
-    ;;
-  coder|reviewer)
-    if printf '%s\n' "$@" | grep -qE -- '--coder-llm|--reviewer-llm'; then
-      echo "✗ --coder-llm/--reviewer-llm 仅用于 both 模式" >&2
-      exit 1
-    fi
-    run_locked "$MODE" "$@"
-    ;;
-  both)
-    parse_role_llm "$@"
-    strip_interval "${REST[@]}"
-    # 显式 --once → 单轮；否则常驻（默认 30s，--interval N 可改）
-    SINGLE=0
-    KEEP=()
-    a=""
-    for a in "${ARGS_NO_INTERVAL[@]}"; do
-      if [ "$a" = "--once" ]; then SINGLE=1; else KEEP+=("$a"); fi
-    done
-    INTERVAL="${INTERVAL:-${AUTOLOOP_DEFAULT_INTERVAL:-30}}"
-    BOTH_LOCK="$ROOT/runtime/locks/autoloop-both.lock"
-    mkdir -p "$(dirname "$BOTH_LOCK")"
-
-    if [ "$SINGLE" = "1" ]; then
-      echo "═══ autoloop both（单轮）：coder（实现）→ reviewer（审查）═══"
-      build_role_args "$CODER_LLM" "${KEEP[@]}"
-      run_locked coder "${ROLE_ARGS[@]}" || exit 1
-      echo "── coder 轮次结束，启动 reviewer（独立会话）──"
-      build_role_args "$REVIEWER_LLM" "${KEEP[@]}"
-      run_locked reviewer "${ROLE_ARGS[@]}"
-      exit 0
-    fi
-
-    # —— 常驻：整段持锁（前台原地 exec；后台子 shell exec 持锁进程）——
-    if [ "${AIOS_LOCK_HELD:-0}" != "1" ]; then
-      FOREGROUND=0
-      a=""
-      for a in "${KEEP[@]}"; do
-        if [ "$a" = "--foreground" ]; then FOREGROUND=1; fi
-      done
-      RE_ARGS=(both "${KEEP[@]}" --interval "$INTERVAL")
-      # TASK-079: parse_role_llm 已把 --coder-llm/--reviewer-llm 剥到 CODER_LLM/
-      # REVIEWER_LLM，必须显式加回 RE_ARGS，否则后台化/前台重入后 per-role LLM
-      # 丢失回落到默认 --llm ${AIOS_LLM:-pi}。
-      if [ -n "$CODER_LLM" ]; then RE_ARGS+=(--coder-llm "$CODER_LLM"); fi
-      if [ -n "$REVIEWER_LLM" ]; then RE_ARGS+=(--reviewer-llm "$REVIEWER_LLM"); fi
-      if [ "$FOREGROUND" = "1" ]; then
-        # 前台：原地 exec → python 持锁 → bash 重入本脚本跑循环（Ctrl-C 停止）
-        AIOS_LOCK_HELD=1 exec "$PY" "$LOCKPY" hold "$BOTH_LOCK" -- bash "$0" "${RE_ARGS[@]}"
-      fi
-      # 后台化（默认）：子 shell exec python 持锁进程，父进程立即返回（无需 nohup &）
-      LOG="$ROOT/runtime/logs/autoloop-both.log"
-      mkdir -p "$(dirname "$LOG")"
-      (
-        AIOS_LOCK_HELD=1 exec "$PY" "$LOCKPY" hold "$BOTH_LOCK" -- bash "$0" "${RE_ARGS[@]}"
-      ) >>"$LOG" 2>&1 &
-      echo "✓ autoloop both 已后台启动（每 ${INTERVAL}s 一轮）"
-      echo "  日志: $LOG"
-      echo "  停止: kill \$(cat $ROOT/runtime/locks/autoloop-both.pid)"
-      exit 0
-    fi
-
-    # —— AIOS_LOCK_HELD=1：持锁运行常驻循环（PID 记录本进程，kill 即停）——
-    echo "$$" > "$ROOT/runtime/locks/autoloop-both.pid"
-    FOREGROUND=0
-    a=""
-    for a in "${KEEP[@]}"; do
-      if [ "$a" = "--foreground" ]; then FOREGROUND=1; fi
-    done
-    trap '' HUP
-    trap 'echo "── both 常驻停止 ──"; exit 0' INT TERM
-    if [ "$FOREGROUND" = "1" ]; then
-      echo "═══ autoloop both 前台常驻（每 ${INTERVAL}s 一轮；Ctrl-C 停止）═══"
-    else
-      echo "═══ autoloop both 后台常驻（PID $$，每 ${INTERVAL}s 一轮）═══"
-    fi
-    while true; do
-      build_role_args "$CODER_LLM" "${KEEP[@]}"
-      run_locked coder "${ROLE_ARGS[@]}" || true
-      build_role_args "$REVIEWER_LLM" "${KEEP[@]}"
-      run_locked reviewer "${ROLE_ARGS[@]}" || true
-      echo "[$(date +%H:%M:%S)] 本轮完成，${INTERVAL}s 后重试"
-      sleep "$INTERVAL"
-    done
-    ;;
-  *)
-    echo "✗ 未知模式: $MODE（支持 coder | reviewer | both）" >&2
-    exit 1
-    ;;
-esac
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,4 +1,4 @@
-"""TASK-027 — kit/tools/agent/ 主循环与常驻单测。
+"""TASK-027 — kit/tools/telemetry/ 主循环与常驻单测。
 
 覆盖：
 - poll_once 一轮：全部成功 / 单项目失败（可重试与不可重试）→ 退避计数 /
@@ -27,7 +27,7 @@ import time
 import unittest
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 复用 test_agent_http 的 mock 服务器

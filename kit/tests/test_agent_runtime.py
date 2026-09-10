@@ -1,4 +1,4 @@
-"""TASK-023 — kit/tools/agent/ runtime 读取模块单测。
+"""TASK-023 — kit/tools/telemetry/ runtime 读取模块单测。
 
 覆盖：
 - 完整项目：tasks（文件名+原文）/focus/heartbeat mtime/events 原文/VERIFY/REVIEW 计数
@@ -14,7 +14,7 @@ import tempfile
 import unittest
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 import agent_runtime  # noqa: E402

@@ -1,7 +1,7 @@
-"""TASK-022 — kit/tools/agent/ 配置加载单测。
+"""TASK-022 — kit/tools/telemetry/ 配置加载单测。
 
 覆盖：
-- 合法配置 → 返回规范化配置（poll_interval_seconds 缺省默认 30）
+- 合法配置 → 返回规范化配置（poll_interval_seconds 缺省默认 10（TASK-086））
 - 缺失 server_url / token / projects → AgentConfigError（消息含字段名）
 - projects 缺 id / path、空数组、非数组 → AgentConfigError
 - 类型错误（server_url 数字、poll 为布尔/字符串/负数）→ AgentConfigError
@@ -17,7 +17,7 @@ import tempfile
 import unittest
 
 AGENT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "agent"
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "telemetry"
 )
 sys.path.insert(0, AGENT_DIR)
 import agent_config  # noqa: E402
@@ -47,11 +47,13 @@ class AgentConfigTests(unittest.TestCase):
         del cfg["poll_interval_seconds"]
         self.assertEqual(agent_config.validate(cfg)["poll_interval_seconds"],
                          agent_config.DEFAULT_POLL_INTERVAL_SECONDS)
-        self.assertEqual(agent_config.DEFAULT_POLL_INTERVAL_SECONDS, 30)
+        # TASK-086 perf：默认 30s → 10s（提交 2602bcd）；TASK-081 测试对齐
+        self.assertEqual(agent_config.DEFAULT_POLL_INTERVAL_SECONDS, 10)
 
     def test_default_poll_interval_when_null(self):
         out = agent_config.validate(valid_cfg(poll_interval_seconds=None))
-        self.assertEqual(out["poll_interval_seconds"], 30)
+        self.assertEqual(out["poll_interval_seconds"],
+                         agent_config.DEFAULT_POLL_INTERVAL_SECONDS)
 
     def test_missing_server_url(self):
         cfg = valid_cfg()

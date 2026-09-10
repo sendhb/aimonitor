@@ -30,13 +30,8 @@ tmp
 *.temp
 .cache/
 
-# AI runtime generated data (keep directory structure, templates, and state files)
-runtime/tasks/TASK-*.md
-runtime/tasks/INDEX.md
-runtime/reviews/REVIEW-*.md
-runtime/verification/VERIFY-*.md
-runtime/logs/*
-runtime/locks/*
+# AI runtime generated data — 整体不入库（本地保留，仅工作区使用）
+runtime/
 
 # Python 编译缓存
 __pycache__/

@@ -134,7 +134,7 @@ class RegistryCliTests(unittest.TestCase):
     def _run(self, cfg, *extra):
         return subprocess.run(
             [sys.executable, DISPATCHER_PY, *extra, "--config", cfg],
-            capture_output=True, text=True, cwd=ROOT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
         )
 
     def test_list_labels_local_and_agent(self):
